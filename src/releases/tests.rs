@@ -582,6 +582,31 @@ fn a_staging_merge_release_fast_forwarded_back_to_dev_keeps_its_pr_and_changes()
 }
 
 #[test]
+fn a_three_lane_merge_release_fast_forwarded_back_to_dev_keeps_its_changes() {
+    let r = three_lanes("syncbackthree");
+    r.merge_pr("dev", 1, "One", &["one"]);
+    r.merge_promote("dev", "staging", 10);
+    r.merge_promote("staging", "main", 11);
+    r.merge_pr("dev", 2, "Two", &["two"]);
+    r.merge_promote("dev", "staging", 13);
+    r.merge_promote("staging", "main", 12);
+    r.checkout("dev");
+    r.git(&["merge", "-q", "--ff-only", "main"]);
+
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!(
+        (rel.pr, rel.fast_forward, rel.known),
+        (Some(12), false, true)
+    );
+    assert!(change(&pg, 2).in_release);
+    assert!(!change(&pg, 1).in_release);
+    for n in [10, 11, 12, 13] {
+        assert_eq!(pg.by_pr[&n], Role::Promotion);
+    }
+}
+
+#[test]
 fn a_fast_forward_release_after_dev_synced_to_staging() {
     let r = three_lanes("ffsynced");
     let ff = |branch: &str, to: &str| {

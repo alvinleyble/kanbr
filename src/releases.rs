@@ -226,17 +226,25 @@ pub fn analyze_refs(
         let log = git.first_parent_log(&r.sha, SCAN)?;
         found.push((i, branch, r, log));
     }
-    let higher: Vec<HashSet<String>> = (0..found.len())
+    // For each lane, the promotion merges it may have been fast-forwarded
+    // to: each commit on a higher lane's first-parent log, with the branches
+    // that could have been promoted by it (this lane up to that higher one).
+    let higher: Vec<HashMap<String, HashSet<String>>> = (0..found.len())
         .map(|n| {
-            found[n + 1..]
-                .iter()
-                .flat_map(|f| f.3.iter().map(|c| c.sha.clone()))
-                .collect()
+            let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+            for k in n + 1..found.len() {
+                for c in &found[k].3 {
+                    m.entry(c.sha.clone())
+                        .or_default()
+                        .extend(found[n..k].iter().map(|f| f.1.to_owned()));
+                }
+            }
+            m
         })
         .collect();
     let mut lanes: Vec<Lane> = Vec::new();
     for ((i, branch, r, log), higher) in found.into_iter().zip(&higher) {
-        let log = own_history(git, log, branch, higher)?;
+        let log = own_history(git, log, higher)?;
         let reach = git.reachable(&[&r.sha], REACH)?;
         let index = log
             .iter()
@@ -310,21 +318,24 @@ struct Analysis<'a> {
     promotions: Promotions<'a>,
 }
 
-/// The landings of `branch` from its first-parent `log`, newest first. When
+/// The landings of a branch from its first-parent `log`, newest first. When
 /// the branch was fast-forwarded to a higher lane, the merges that promoted it
-/// there (on a higher lane's first-parent history, in `higher`) are not its
-/// own landings: its history continues through what each one merged.
+/// (or a lane between) there are not its own landings: its history continues
+/// through what each one merged. `higher` maps each commit on a higher lane's
+/// first-parent history to the branches a promotion there may come from.
 fn own_history(
     git: &Git,
     mut log: Vec<Commit>,
-    branch: &str,
-    higher: &HashSet<String>,
+    higher: &HashMap<String, HashSet<String>>,
 ) -> Result<Vec<Commit>, String> {
     let mut i = 0;
     while i < log.len() {
         let synced = log[i].parents.len() > 1
-            && higher.contains(&log[i].sha)
-            && pr_of(&log[i]).and_then(|p| p.2).as_deref() == Some(branch);
+            && higher.get(&log[i].sha).is_some_and(|from| {
+                pr_of(&log[i])
+                    .and_then(|p| p.2)
+                    .is_some_and(|b| from.contains(&b))
+            });
         if synced {
             let merged = log[i].parents[1].clone();
             log.truncate(i);

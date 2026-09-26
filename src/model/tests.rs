@@ -318,6 +318,8 @@ fn second_mate_work_mixes_into_project_columns_with_tag() {
 
     let flagged = card(&b, "tool-cli-flags");
     assert_eq!(flagged.state, "needs decision");
+    assert!(flagged.decision);
+    assert_eq!(flagged.column, Column::Building);
     assert_eq!(flagged.project, "tool");
 
     let queued = card(&b, "site-dark-mode");
@@ -337,8 +339,13 @@ fn second_mate_work_mixes_into_project_columns_with_tag() {
 fn waiting_lists_every_captain_decision() {
     let b = fixture_board();
     let ids: Vec<&str> = b.waiting().iter().map(|c| c.id.as_str()).collect();
-    assert_eq!(ids.len(), 3);
-    for id in ["shop-print-queue", "shop-promote-main", "site-pricing-page"] {
+    assert_eq!(ids.len(), 4);
+    for id in [
+        "shop-print-queue",
+        "shop-promote-main",
+        "site-pricing-page",
+        "tool-cli-flags",
+    ] {
         assert!(ids.contains(&id), "{id}");
     }
 }

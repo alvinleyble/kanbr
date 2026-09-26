@@ -569,7 +569,7 @@ impl<'a> Builder<'a> {
             project,
             owner,
             column: Column::Building,
-            decision: bool_at(r, "captain_actionable"),
+            decision: pending || bool_at(r, "captain_actionable"),
             grill: false,
             paused: false,
             blocked_by: strings_at(r, "unresolved_blocker_ids"),

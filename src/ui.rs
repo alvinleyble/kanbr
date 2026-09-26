@@ -1,7 +1,9 @@
 //! The interactive board: tabs, the waiting-on-you strip, six columns of
-//! compact cards, and a details view. Read-only.
+//! compact cards with release headers over Staging and Live, a details view,
+//! release details, and copyable release notes. Read-only.
 
-use std::io;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,8 +24,11 @@ use crate::dates::now_epoch;
 use crate::firstmate::fingerprint;
 use crate::loader::Loader;
 use crate::model::{Board, Card, Column, Owner, TestBadge, Tone};
+use crate::notes::{column_header, details, release_notes};
 
 const CARD_ROWS: u16 = 3;
+/// Rows above a column's cards: the title, the release line, and a rule.
+const HEADER_ROWS: u16 = 3;
 const CARD_SLOT: u16 = CARD_ROWS + 1;
 const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
@@ -38,6 +43,10 @@ pub enum Modal {
     Details(String),
     Help,
     Notices,
+    /// Release details for the tab: the Live release and the next release.
+    Release,
+    /// Plain-language release notes for the tab's Live release, to copy.
+    Notes,
 }
 
 #[derive(Default)]
@@ -45,6 +54,8 @@ struct Hits {
     tabs: Vec<(Rect, usize)>,
     strip: Option<Rect>,
     columns: Vec<(Rect, usize)>,
+    /// Release-column headers, which open the release details.
+    headers: Vec<(Rect, usize)>,
     cards: Vec<(Rect, usize, usize)>,
 }
 
@@ -69,6 +80,10 @@ pub struct App {
     now: Option<i64>,
     /// Column labels from the config, in board order.
     pub labels: [String; 6],
+    /// Text waiting to be copied to the clipboard by the run loop.
+    pub copy: Option<String>,
+    /// The outcome of the last copy, shown in the notes view.
+    pub flash: Option<String>,
 }
 
 impl App {
@@ -93,6 +108,8 @@ impl App {
             force: false,
             now: None,
             labels: Column::ALL.map(|c| c.title().to_owned()),
+            copy: None,
+            flash: None,
         }
     }
 
@@ -141,7 +158,7 @@ impl App {
         tabs
     }
 
-    fn tab_project(&self) -> Option<&str> {
+    pub fn tab_project(&self) -> Option<&str> {
         if self.tab == 0 {
             return None;
         }
@@ -281,6 +298,20 @@ impl App {
         }
     }
 
+    fn open_modal(&mut self, modal: Modal) {
+        if self.board.is_some() {
+            self.modal = modal;
+            self.modal_scroll = 0;
+            self.flash = None;
+        }
+    }
+
+    /// Whether the terminal should report mouse events: not while the release
+    /// notes are open, so the terminal's own selection can copy them.
+    pub fn wants_mouse(&self) -> bool {
+        self.modal != Modal::Notes
+    }
+
     /// Whether a refresh was requested since the last call.
     pub fn take_force(&mut self) -> bool {
         std::mem::take(&mut self.force)
@@ -295,6 +326,13 @@ impl App {
             return;
         }
         if self.modal != Modal::None {
+            if self.modal == Modal::Notes && key.code == KeyCode::Char('c') {
+                self.copy = self
+                    .board
+                    .as_ref()
+                    .map(|b| release_notes(b, self.tab_project()));
+                return;
+            }
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.modal_scroll = self.modal_scroll.saturating_sub(1)
@@ -304,8 +342,9 @@ impl App {
                 }
                 KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(10),
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | '?' | 'n') => {
-                    self.modal = Modal::None
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | '?' | 'n' | 'i' | 'R') => {
+                    self.modal = Modal::None;
+                    self.flash = None;
                 }
                 _ => {}
             }
@@ -334,6 +373,8 @@ impl App {
             KeyCode::Char('w') => self.jump_waiting(),
             KeyCode::Char('r') => self.force = true,
             KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::Char('i') => self.open_modal(Modal::Release),
+            KeyCode::Char('R') => self.open_modal(Modal::Notes),
             KeyCode::Char('n') => {
                 let has_notices = self.error.is_some()
                     || self.board.as_ref().is_some_and(|b| !b.notices.is_empty());
@@ -360,6 +401,11 @@ impl App {
                 }
                 if self.hits.strip.is_some_and(|r| r.contains(pos)) {
                     self.jump_waiting();
+                    return;
+                }
+                if let Some(&(_, col)) = self.hits.headers.iter().find(|(r, _)| r.contains(pos)) {
+                    self.col = col;
+                    self.open_modal(Modal::Release);
                     return;
                 }
                 if let Some(&(_, col, idx)) =
@@ -468,11 +514,22 @@ const SELECTED_BG: Color = Color::Indexed(237);
 /// The three lines of a compact card, fitted to `width` cells.
 pub fn card_lines(card: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<'static>> {
     let greyed = card.paused;
-    let fg = |c: Color| if greyed { Color::DarkGray } else { c };
+    let plain = card.outside;
+    let fg = |c: Color| {
+        if greyed {
+            Color::DarkGray
+        } else if plain {
+            Color::Gray
+        } else {
+            c
+        }
+    };
     let marker_color = if selected {
         Color::White
     } else if card.decision {
         Color::Red
+    } else if plain {
+        Color::DarkGray
     } else {
         fg(project_color(&card.project))
     };
@@ -544,7 +601,11 @@ pub fn card_lines(card: &Card, width: usize, selected: bool, now: i64) -> Vec<Li
     let title_style = if greyed {
         DIM
     } else if selected {
-        Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(if plain { Color::Gray } else { Color::White })
+            .add_modifier(Modifier::BOLD)
+    } else if plain {
+        Style::new().fg(Color::Gray)
     } else {
         Style::new().fg(Color::White)
     };
@@ -655,6 +716,8 @@ pub fn render(app: &mut App, f: &mut Frame) {
         Modal::Details(id) => render_details(app, f, area, &id),
         Modal::Help => render_help(f, area),
         Modal::Notices => render_notices(app, f, area),
+        Modal::Release => render_release(app, f, area),
+        Modal::Notes => render_notes(app, f, area),
     }
 }
 
@@ -769,7 +832,7 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
         let inner = block.inner(*rect);
         f.render_widget(block, *rect);
         app.hits.columns.push((*rect, ci));
-        if inner.height < 3 || inner.width < 4 {
+        if inner.height < HEADER_ROWS + 1 || inner.width < 4 {
             continue;
         }
         let cards: Vec<Card> = app.column_cards(ci).into_iter().cloned().collect();
@@ -790,11 +853,40 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
             Paragraph::new(header),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
+        let column = Column::ALL[ci];
+        if let Some(meta) = app
+            .board
+            .as_ref()
+            .and_then(|b| column_header(b, column, app.tab_project()))
+        {
+            let style = if meta == "not used" {
+                DIM
+            } else {
+                Style::new().fg(Color::Cyan)
+            };
+            f.render_widget(
+                Paragraph::new(Line::styled(
+                    truncate(&format!(" {meta}"), inner.width as usize),
+                    style,
+                )),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+        }
+        if matches!(column, Column::Dev | Column::Staging | Column::Live) {
+            app.hits
+                .headers
+                .push((Rect::new(inner.x, inner.y, inner.width, 2), ci));
+        }
         f.render_widget(
             Paragraph::new(Line::styled("─".repeat(inner.width as usize), DIM)),
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
-        let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
+        let list = Rect::new(
+            inner.x,
+            inner.y + HEADER_ROWS,
+            inner.width,
+            inner.height - HEADER_ROWS,
+        );
         let fits_all = (list.height + 1) / CARD_SLOT;
         let visible = if cards.len() as u16 > fits_all {
             (list.height / CARD_SLOT).max(1)
@@ -837,7 +929,7 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
 }
 
 fn render_footer(app: &App, f: &mut Frame, area: Rect) {
-    let keys = " ←→ column  ↑↓ card  enter details  w waiting  1-9 tab  r refresh  ? help  q quit";
+    let keys = " ←→ column  ↑↓ card  enter details  w waiting  1-9 tab  i release  R notes  r refresh  ? help  q quit";
     let status = if app.loading {
         "refreshing…".to_owned()
     } else if let Some(t) = app.loaded_at {
@@ -946,6 +1038,11 @@ fn render_help(f: &mut Frame, area: Rect) {
             "jump to the next card waiting on you",
         ),
         ("n", "list notices (what the board could not show)"),
+        (
+            "i / click a lane header",
+            "release details: Live release, next release, database changes",
+        ),
+        ("R", "release notes for the Live release (c copies them)"),
         ("r", "refresh now"),
         ("q", "quit"),
     ];
@@ -973,7 +1070,15 @@ fn render_help(f: &mut Frame, area: Rect) {
         Span::styled("2nd", Style::new().fg(Color::Black).bg(Color::LightBlue)),
         Span::raw(" second mate's work"),
     ]));
-    let r = centered(area, 70, 70, 50, 18);
+    lines.push(Line::from(vec![
+        Span::styled("grey card", Style::new().fg(Color::Gray)),
+        Span::raw(" a merged change with no Firstmate card (hand-opened PR or direct commit)"),
+    ]));
+    lines.push(Line::styled(
+        "Dev, Staging, and Live come from git: each change sits in the furthest branch it has reached, and Live shows only the latest release. The board reads each clone as of its last fetch.",
+        DIM,
+    ));
+    let r = centered(area, 70, 75, 50, 24);
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines)
@@ -1003,6 +1108,144 @@ fn render_notices(app: &App, f: &mut Frame, area: Rect) {
             .scroll((app.modal_scroll, 0)),
         r,
     );
+}
+
+fn render_release(app: &App, f: &mut Frame, area: Rect) {
+    let Some(board) = &app.board else { return };
+    let label = Style::new().fg(Color::Cyan);
+    let mut lines = Vec::new();
+    for d in details(board, app.tab_project(), app.now()) {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            d.project,
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        for (k, v) in d.rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {k:<13} "), label),
+                Span::raw(v),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw(
+            "No release information: Kanbr found no readable repository with a Dev, Staging, or Live branch for the projects on this tab.",
+        ));
+    }
+    let r = centered(area, 80, 70, 40, 10);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(
+                " Releases · R release notes · esc to close ".to_owned(),
+            ))
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+fn render_notes(app: &App, f: &mut Frame, area: Rect) {
+    let Some(board) = &app.board else { return };
+    let text = release_notes(board, app.tab_project());
+    let lines: Vec<Line> = text.lines().map(|l| Line::raw(l.to_owned())).collect();
+    let r = centered(area, 80, 80, 40, 10);
+    // Top and bottom rules only, so selecting the text copies no borders.
+    let mut block = Block::new()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Span::styled(
+            " Release notes · c copy · select with the mouse · esc to close ",
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+    if let Some(flash) = &app.flash {
+        block = block.title_bottom(Span::styled(
+            format!(" {flash} "),
+            Style::new().fg(Color::Green),
+        ));
+    }
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+// ---------------------------------------------------------------- clipboard
+
+/// Copies text with the platform clipboard tool, falling back to the OSC 52
+/// terminal escape (which Herdr and most terminals pass to the clipboard).
+fn copy_to_clipboard(text: &str) -> String {
+    let tools: [(&str, &[&str]); 4] = [
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (tool, args) in tools {
+        let Ok(mut child) = Command::new(tool)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let wrote = child
+            .stdin
+            .take()
+            .is_some_and(|mut i| i.write_all(text.as_bytes()).is_ok());
+        let started = Instant::now();
+        let ok = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        if wrote && ok {
+            return format!("copied with {tool}");
+        }
+    }
+    let mut out = io::stdout();
+    let sent = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).and_then(|()| out.flush());
+    match sent {
+        Ok(()) => "sent to the terminal clipboard (OSC 52)".to_owned(),
+        Err(e) => format!("copy failed: {e}"),
+    }
+}
+
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- run loop
@@ -1056,10 +1299,22 @@ pub fn run(loader: Loader) -> io::Result<()> {
 
     let mut app = App::new(home_label);
     app.labels = labels;
+    let mut mouse = true;
     let result = (|| -> io::Result<()> {
         loop {
             while let Ok(msg) = rx.try_recv() {
                 app.apply(msg);
+            }
+            if app.wants_mouse() != mouse {
+                mouse = app.wants_mouse();
+                if mouse {
+                    execute!(io::stdout(), EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), DisableMouseCapture)?;
+                }
+            }
+            if let Some(text) = app.copy.take() {
+                app.flash = Some(copy_to_clipboard(&text));
             }
             terminal.draw(|f| render(&mut app, f))?;
             if event::poll(Duration::from_millis(250))? {

@@ -233,3 +233,101 @@ fn truncation_is_width_aware() {
     assert_eq!(truncate("日本語", 2), "…");
     assert_eq!(truncate("anything", 0), "");
 }
+
+fn release_app() -> App {
+    App::with_board(crate::model::tests::release_board(), "/fm".into(), now())
+}
+
+#[test]
+fn release_headers_sit_under_staging_and_live() {
+    let mut a = release_app();
+    let shop = tab_index(&a, "Shop");
+    a.select_tab(shop);
+    let screen = draw(&mut a, 252, 40);
+    assert!(
+        screen.contains("25 Sep · #150 · v1.2.1 · 4 changes"),
+        "{screen}"
+    );
+    assert!(screen.contains("1 to promote · 1 db change"), "{screen}");
+    let site = tab_index(&a, "Site");
+    a.select_tab(site);
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains("not used"), "Site has no staging\n{screen}");
+}
+
+#[test]
+fn i_opens_release_details_and_capital_r_the_notes() {
+    let mut a = release_app();
+    let shop = tab_index(&a, "Shop");
+    a.select_tab(shop);
+    press(&mut a, KeyCode::Char('i'));
+    assert_eq!(a.modal, Modal::Release);
+    let screen = draw(&mut a, 160, 40);
+    assert!(
+        screen.contains("https://github.com/acme/shop/pull/150"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("supabase/migrations/20260926_fee.sql"),
+        "{screen}"
+    );
+    press(&mut a, KeyCode::Esc);
+    assert_eq!(a.modal, Modal::None);
+
+    press(&mut a, KeyCode::Char('R'));
+    assert_eq!(a.modal, Modal::Notes);
+    assert!(
+        !a.wants_mouse(),
+        "the terminal selects text while notes are open"
+    );
+    let screen = draw(&mut a, 160, 40);
+    assert!(
+        screen.contains("Shop 1.2.1 — released 25 Sep 2026"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("- Persistent delivery fee per customer"),
+        "{screen}"
+    );
+    press(&mut a, KeyCode::Char('c'));
+    let copied = a.copy.take().expect("c asks the run loop to copy");
+    assert!(copied.starts_with("Shop 1.2.1"), "{copied}");
+    assert_eq!(a.modal, Modal::Notes, "copying keeps the notes open");
+    press(&mut a, KeyCode::Esc);
+    assert!(a.wants_mouse());
+}
+
+#[test]
+fn clicking_a_release_header_opens_the_release_details() {
+    let mut a = release_app();
+    draw(&mut a, 200, 40);
+    let (rect, col) = *a.hits.headers.iter().find(|(_, c)| *c == 5).unwrap();
+    click(&mut a, rect.x + 1, rect.y);
+    assert_eq!(a.modal, Modal::Release);
+    assert_eq!(a.col, col);
+    assert!(
+        a.hits.headers.iter().all(|(_, c)| *c >= 3),
+        "only Dev, Staging, and Live headers open it"
+    );
+}
+
+#[test]
+fn cards_without_a_firstmate_card_are_grey() {
+    let b = crate::model::tests::release_board();
+    let outside = b.cards.iter().find(|c| c.id == "Shop#141").unwrap();
+    let lines = card_lines(outside, 30, false, now());
+    let title = lines[1].spans.last().unwrap();
+    assert_eq!(title.style.fg, Some(Color::Gray));
+    let tracked = b.cards.iter().find(|c| c.id == "shop-deploy-hook").unwrap();
+    let lines = card_lines(tracked, 30, false, now());
+    assert_eq!(lines[1].spans.last().unwrap().style.fg, Some(Color::White));
+}
+
+#[test]
+fn base64_matches_the_standard_alphabet() {
+    assert_eq!(base64(b""), "");
+    assert_eq!(base64(b"f"), "Zg==");
+    assert_eq!(base64(b"fo"), "Zm8=");
+    assert_eq!(base64(b"foo"), "Zm9v");
+    assert_eq!(base64("Shop — 1".as_bytes()), "U2hvcCDigJQgMQ==");
+}

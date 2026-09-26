@@ -10,14 +10,19 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::{Config, resolve_home};
-use crate::dates::now_epoch;
+use crate::dates::{DAY, format_ago, format_day, now_epoch};
 use crate::firstmate::{
-    PROJECTS_REGISTRY, SNAPSHOT_SCHEMA, SNAPSHOT_SCRIPT, SNAPSHOT_TIMEOUT, SURFACES, read_lanes,
-    read_meta, read_projects_registry, run_bounded, run_snapshot,
+    PROJECTS_REGISTRY, SNAPSHOT_SCHEMA, SNAPSHOT_SCRIPT, SNAPSHOT_TIMEOUT, SURFACES, read_meta,
+    read_projects_registry, run_bounded, run_snapshot,
 };
+use crate::forge::{self, GhError};
 use crate::json::{arr_at, get, str_at};
 use crate::loader::Loader;
-use crate::model::{Column, Context, build_board};
+use crate::model::{Column, Context, Env, build_board};
+use crate::releases::ProjectGit;
+
+/// A clone not fetched for this long makes the board lag the forge.
+const STALE_FETCH_DAYS: i64 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -285,6 +290,71 @@ fn git_available() -> bool {
     matches!(run_bounded(cmd, Duration::from_secs(5)), Ok((Some(s), _, _)) if s.success())
 }
 
+/// One project's release reading: the refs behind its lanes, its latest
+/// release, database changes waiting in Staging, and how fresh the clone is.
+/// A stale clone only warns for a project on the board (`shown`).
+pub fn project_check(name: &str, pg: &ProjectGit, config: &Config, now: i64, shown: bool) -> Check {
+    if pg.refs.is_empty() {
+        let [d, s, l] = config.branches();
+        return check(
+            Level::Ok,
+            "project git",
+            format!(
+                "{name}: none of the configured branches (dev={d}, staging={s}, live={l}); its finished cards are not shown"
+            ),
+        );
+    }
+    let refs: Vec<String> = pg
+        .refs
+        .iter()
+        .map(|r| {
+            r.refname
+                .strip_prefix("refs/remotes/")
+                .or_else(|| r.refname.strip_prefix("refs/heads/"))
+                .unwrap_or(&r.refname)
+                .to_owned()
+        })
+        .collect();
+    let mut detail = format!("{name}: {}", refs.join(" "));
+    if let Some(r) = &pg.release {
+        let _ = write!(detail, "; latest release {}", format_day(r.time));
+        if let Some(n) = r.pr {
+            let _ = write!(detail, " #{n}");
+        }
+        if let Some(v) = &r.version {
+            let _ = write!(detail, " v{v}");
+        }
+    }
+    if !pg.migrations.is_empty() {
+        let _ = write!(
+            detail,
+            "; {} database change(s) waiting in staging",
+            pg.migrations.len()
+        );
+    }
+    let tracked = shown
+        && pg
+            .refs
+            .iter()
+            .any(|r| r.refname.starts_with("refs/remotes/"));
+    let mut level = Level::Ok;
+    match pg.fetched {
+        Some(f) => {
+            let _ = write!(detail, "; fetched {}", format_ago(f, now));
+            if tracked && now - f > STALE_FETCH_DAYS * DAY {
+                level = Level::Warn;
+                detail.push_str(": the board lags the forge until the clone fetches");
+            }
+        }
+        None if tracked => {
+            level = Level::Warn;
+            detail.push_str("; never fetched: the board shows the branches as cloned");
+        }
+        None => {}
+    }
+    check(level, "project git", detail)
+}
+
 /// Runs every check. `home_flag` and `config_path` are the CLI overrides.
 pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
     let mut out = Vec::new();
@@ -403,12 +473,21 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
         }
     };
 
+    let loader = Loader::new(home.clone(), config.clone());
+    let now = now_epoch();
+    let ctx = Context {
+        registry: &registry,
+        config: &config,
+        now,
+        env: &loader,
+    };
+    let board = build_board(&snap, &ctx);
     if git_available() {
         let projects_dir = str_at(&snap, "roots.projects")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("projects"));
-        let mut read = Vec::new();
-        let mut unreadable = Vec::new();
+        let mut no_clone = Vec::new();
+        let mut repos = Vec::new();
         let names = std::iter::once("firstmate".to_owned()).chain(registry.iter().cloned());
         for name in names {
             let path = if name == "firstmate" {
@@ -416,58 +495,57 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
             } else {
                 projects_dir.join(&name)
             };
-            match read_lanes(&path, config.branches()) {
-                Some(l) => {
-                    let used: Vec<&str> =
-                        [(l.dev, "dev"), (l.staging, "staging"), (l.live, "live")]
-                            .into_iter()
-                            .filter_map(|(u, n)| u.then_some(n))
-                            .collect();
-                    read.push(format!(
-                        "{name} {}",
-                        if used.is_empty() {
-                            "-".to_owned()
-                        } else {
-                            used.join("+")
-                        }
-                    ));
-                }
-                None => unreadable.push(name),
+            match loader.git(&path) {
+                None => no_clone.push(name),
+                Some(Ok(pg)) => repos.push((name, pg)),
+                Some(Err(e)) => out.push(check(
+                    Level::Warn,
+                    "project git",
+                    format!("{name}: history unreadable ({e}); only the last lane assumed"),
+                )),
             }
         }
-        let mut detail = read.join(", ");
-        if !unreadable.is_empty() {
-            let _ = write!(
-                detail,
-                "; no readable repo (only the last lane assumed): {}",
-                unreadable.join(", ")
-            );
+        // Staleness matters only for projects the board shows.
+        for (name, pg) in repos {
+            let on_board = board.release(&name).is_some();
+            out.push(project_check(&name, &pg, &config, now, on_board));
         }
-        out.push(check(
-            if unreadable.is_empty() {
-                Level::Ok
-            } else {
-                Level::Warn
-            },
-            "project lanes",
-            detail,
-        ));
+        if !no_clone.is_empty() {
+            out.push(check(
+                Level::Warn,
+                "project git",
+                format!(
+                    "no clone to read (only the last lane assumed): {}",
+                    no_clone.join(", ")
+                ),
+            ));
+        }
     } else {
         out.push(check(
             Level::Warn,
-            "project lanes",
-            "git not found; every project is assumed to use only the last lane",
+            "project git",
+            "git not found; every project is assumed to use only the last lane and releases are not shown",
         ));
     }
+    out.push(match forge::status() {
+        Ok(s) => check(
+            Level::Ok,
+            "gh",
+            format!("{s}; asked only about a merged PR whose merge message has no PR number"),
+        ),
+        Err(e) => check(
+            Level::Warn,
+            "gh",
+            format!(
+                "{}: a merged PR whose merge message has no PR number (a rebase merge or an edited message) is placed by its merge date",
+                match e {
+                    GhError::Missing => "not installed".to_owned(),
+                    GhError::Failed(why) => format!("not usable ({why})"),
+                }
+            ),
+        ),
+    });
 
-    let loader = Loader::new(home.clone(), config.clone());
-    let ctx = Context {
-        registry: &registry,
-        config: &config,
-        now: now_epoch(),
-        env: &loader,
-    };
-    let board = build_board(&snap, &ctx);
     let open_rows = arr_at(&snap, "backlog.records")
         .iter()
         .filter(|r| get(r, "structured").as_bool() == Some(true))

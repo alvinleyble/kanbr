@@ -1,29 +1,40 @@
-//! Loads a board from a Firstmate home, caching the cheap side reads between
-//! refreshes (meta files by modification time, git lanes for a few minutes).
+//! Loads a board from a Firstmate home, caching the side reads between
+//! refreshes: meta files by modification time, each project's release
+//! analysis until one of its lane branches moves or the clone fetches, and
+//! forge answers about merged PRs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
 use crate::dates::now_epoch;
-use crate::firstmate::{
-    Lanes, Meta, SNAPSHOT_TIMEOUT, read_lanes, read_meta, read_projects_registry, run_snapshot,
-};
+use crate::firstmate::{Meta, SNAPSHOT_TIMEOUT, read_meta, read_projects_registry, run_snapshot};
+use crate::forge::{self, GhError};
+use crate::git::{Git, fetch_time, is_checkout};
 use crate::model::{Board, Context, Env, build_board};
+use crate::releases::{Memo, ProjectGit, analyze_refs, lane_tips};
 
-const LANES_TTL: Duration = Duration::from_secs(300);
+/// How long an answer about an unmerged or unknown PR is trusted.
+const FORGE_TTL: Duration = Duration::from_secs(600);
 
 /// Meta files by path, with the modification time they were read at.
 type MetaCache = HashMap<PathBuf, (Option<SystemTime>, Option<Meta>)>;
+
+/// What a release analysis was computed from: the lane tips and the last fetch.
+type GitKey = (Vec<Option<String>>, Option<i64>);
 
 pub struct Loader {
     pub home: PathBuf,
     pub config: Config,
     metas: RefCell<MetaCache>,
-    lanes: RefCell<HashMap<PathBuf, (Instant, Option<Lanes>)>>,
+    gits: RefCell<HashMap<PathBuf, (GitKey, Arc<ProjectGit>)>>,
+    memos: RefCell<HashMap<PathBuf, Memo>>,
+    forge: RefCell<HashMap<String, (Instant, Option<String>)>>,
+    gh_missing: Cell<bool>,
 }
 
 impl Loader {
@@ -32,7 +43,10 @@ impl Loader {
             home,
             config,
             metas: RefCell::new(HashMap::new()),
-            lanes: RefCell::new(HashMap::new()),
+            gits: RefCell::new(HashMap::new()),
+            memos: RefCell::new(HashMap::new()),
+            forge: RefCell::new(HashMap::new()),
+            gh_missing: Cell::new(false),
         }
     }
 
@@ -72,15 +86,53 @@ impl Env for Loader {
         meta
     }
 
-    fn lanes(&self, repo: &Path) -> Option<Lanes> {
-        let mut cache = self.lanes.borrow_mut();
-        if let Some((at, lanes)) = cache.get(repo)
-            && at.elapsed() < LANES_TTL
-        {
-            return *lanes;
+    fn git(&self, repo: &Path) -> Option<Result<Arc<ProjectGit>, String>> {
+        if !is_checkout(repo) {
+            return None;
         }
-        let lanes = read_lanes(repo, self.config.branches());
-        cache.insert(repo.to_path_buf(), (Instant::now(), lanes));
-        lanes
+        let git = Git::new(repo);
+        let refs = match git.branches() {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        let branches = self.config.branches();
+        let key = (lane_tips(&refs, branches), fetch_time(repo));
+        if let Some((k, pg)) = self.gits.borrow().get(repo)
+            && *k == key
+        {
+            return Some(Ok(pg.clone()));
+        }
+        let mut memos = self.memos.borrow_mut();
+        let memo = memos.entry(repo.to_path_buf()).or_default();
+        let result = analyze_refs(&git, &refs, branches, memo).map(Arc::new);
+        if let Ok(pg) = &result {
+            self.gits
+                .borrow_mut()
+                .insert(repo.to_path_buf(), (key, pg.clone()));
+        }
+        Some(result)
+    }
+
+    fn merged_commit(&self, pr_url: &str) -> Option<String> {
+        if self.gh_missing.get() {
+            return None;
+        }
+        if let Some((at, sha)) = self.forge.borrow().get(pr_url)
+            && (sha.is_some() || at.elapsed() < FORGE_TTL)
+        {
+            return sha.clone();
+        }
+        let sha = match forge::merged_commit(pr_url) {
+            Ok(sha) => sha,
+            Err(GhError::Missing) => {
+                self.gh_missing.set(true);
+                return None;
+            }
+            Err(GhError::Failed(_)) => None,
+        };
+        self.forge
+            .borrow_mut()
+            .insert(pr_url.to_owned(), (Instant::now(), sha.clone()));
+        sha
     }
 }

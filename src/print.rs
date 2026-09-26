@@ -4,6 +4,7 @@ use std::fmt::Write;
 
 use crate::config::Config;
 use crate::model::{Board, Card, Column};
+use crate::notes::{column_header, details};
 
 fn card_line(card: &Card, now: i64) -> String {
     let mut s = String::from("  ");
@@ -15,6 +16,9 @@ fn card_line(card: &Card, now: i64) -> String {
     }
     if card.paused {
         s.push_str("[paused] ");
+    }
+    if card.outside {
+        s.push_str("[no card] ");
     }
     if !card.blocked_by.is_empty() {
         let _ = write!(s, "[after {}] ", card.blocked_by.join(","));
@@ -78,9 +82,25 @@ pub fn render_text(board: &Board, config: &Config, tab: Option<&str>, now: i64) 
     }
     for column in Column::ALL {
         let cards = board.column_cards(column, tab);
-        let _ = writeln!(out, "\n{} ({})", config.label(column), cards.len());
+        let _ = write!(out, "\n{} ({})", config.label(column), cards.len());
+        match column_header(board, column, tab) {
+            Some(h) => {
+                let _ = writeln!(out, " — {h}");
+            }
+            None => out.push('\n'),
+        }
         for c in cards {
             let _ = writeln!(out, "{}", card_line(c, now));
+        }
+    }
+    let releases = details(board, tab, now);
+    if !releases.is_empty() {
+        let _ = writeln!(out, "\nReleases");
+        for d in releases {
+            let _ = writeln!(out, "  {}", d.project);
+            for (k, v) in d.rows {
+                let _ = writeln!(out, "    {k:<13} {v}");
+            }
         }
     }
     out
@@ -121,6 +141,29 @@ mod tests {
         assert!(text.contains("legacy (2, halted)"), "{text}");
         assert!(text.contains("[after kanbr-1-board]"), "{text}");
         assert!(text.contains("Site 2nd #15"), "{text}");
+    }
+
+    #[test]
+    fn prints_release_headers_and_grey_cards() {
+        let b = crate::model::tests::release_board();
+        let text = render_text(&b, &Config::default(), Some("Shop"), now());
+        assert!(
+            text.contains("Live (5) — 25 Sep · #150 · v1.2.1 · 4 changes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Staging (1) — 1 to promote · 1 db change"),
+            "{text}"
+        );
+        assert!(text.contains("[no card] Shop #141"), "{text}");
+        assert!(
+            text.contains("Promotion PR  https://github.com/acme/shop/pull/150"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Database      supabase/migrations/20260926_fee.sql"),
+            "{text}"
+        );
     }
 
     #[test]

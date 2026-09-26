@@ -4,11 +4,15 @@ mod config;
 mod dates;
 mod doctor;
 mod firstmate;
+mod forge;
+mod git;
 mod herdr;
 mod json;
 mod loader;
 mod model;
+mod notes;
 mod print;
+mod releases;
 mod ui;
 
 use std::io::IsTerminal;
@@ -24,6 +28,7 @@ kanbr - a Kanban board for Firstmate work inside Herdr
 Usage:
   kanbr [--home PATH] [--config PATH]           open the board
   kanbr print [--tab PROJECT] [--home PATH]     print the board once as text
+  kanbr notes [--tab PROJECT] [--home PATH]     print release notes for the Live release
   kanbr doctor [--home PATH]                    verify every Firstmate surface Kanbr reads
   kanbr open [--home PATH]                      open the board in its own Herdr workspace
   kanbr --version | --help
@@ -33,7 +38,7 @@ Options:
                   config file, the current directory, or ~/firstmate)
   --config PATH   config file (else $HERDR_PLUGIN_CONFIG_DIR/config, then
                   $XDG_CONFIG_HOME/kanbr/config or ~/.config/kanbr/config)
-  --tab PROJECT   with print: only that project's cards
+  --tab PROJECT   with print or notes: only that project
 
 Kanbr only reads Firstmate state; it never changes it.
 ";
@@ -71,14 +76,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--tab" => out.tab = Some(value("--tab")?),
             "help" if out.command.is_none() => out.help = true,
             cmd if !cmd.starts_with('-') && out.command.is_none() => match cmd {
-                "board" | "print" | "doctor" | "open" => out.command = Some(cmd.to_owned()),
+                "board" | "print" | "notes" | "doctor" | "open" => {
+                    out.command = Some(cmd.to_owned())
+                }
                 _ => return Err(format!("unknown command `{cmd}`")),
             },
             other => return Err(format!("unexpected argument `{other}`")),
         }
     }
-    if out.tab.is_some() && out.command.as_deref() != Some("print") {
-        return Err("--tab only applies to `kanbr print`".to_owned());
+    if out.tab.is_some() && !matches!(out.command.as_deref(), Some("print" | "notes")) {
+        return Err("--tab only applies to `kanbr print` and `kanbr notes`".to_owned());
     }
     Ok(out)
 }
@@ -137,7 +144,7 @@ fn main() -> ExitCode {
     };
 
     match args.command.as_deref() {
-        Some("print") => {
+        Some(cmd @ ("print" | "notes")) => {
             let loader = Loader::new(home, config.clone());
             match loader.load() {
                 Ok(board) => {
@@ -147,6 +154,10 @@ fn main() -> ExitCode {
                         return fail(&format!(
                             "no tab `{t}`: that project has no work on the board"
                         ));
+                    }
+                    if cmd == "notes" {
+                        print!("{}", notes::release_notes(&board, args.tab.as_deref()));
+                        return ExitCode::SUCCESS;
                     }
                     print!(
                         "{}",
@@ -187,6 +198,10 @@ mod tests {
     #[test]
     fn parses_commands_and_flags() {
         assert_eq!(parse(&[]).unwrap(), Args::default());
+        assert_eq!(
+            parse(&["notes", "--tab", "Shop"]).unwrap().tab.as_deref(),
+            Some("Shop")
+        );
         let a = parse(&["print", "--home", "/fm", "--tab=Shop"]).unwrap();
         assert_eq!(a.command.as_deref(), Some("print"));
         assert_eq!(a.home, Some(PathBuf::from("/fm")));

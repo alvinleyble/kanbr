@@ -234,3 +234,158 @@ fn listing(root: &Path) -> Vec<(PathBuf, u64)> {
     out.sort();
     out
 }
+
+/// Runs git in `dir` with a fixed identity and commit time.
+fn git(dir: &Path, args: &[&str], time: i64) {
+    let date = format!("@{time} +0000");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A fake home whose snapshot points at its own projects directory, with a
+/// Shop repository: the fixture's PR #139 and a hand-opened PR #140 merged to
+/// dev and promoted through staging to main (#150), then #141 merged to dev.
+fn home_with_shop_repo(name: &str) -> FakeHome {
+    let home = FakeHome::serving_fixture(name);
+    let projects = home.root.join("projects");
+    fs::write(
+        home.root.join("snapshot.json"),
+        FIXTURE.replace(
+            "\"/fm/projects\"",
+            &format!("{:?}", projects.display().to_string()),
+        ),
+    )
+    .unwrap();
+    let repo = projects.join("Shop");
+    fs::create_dir_all(&repo).unwrap();
+    let mut t = 1_790_400_000;
+    let mut g = |args: &[&str]| {
+        t += 60;
+        git(&repo, args, t);
+    };
+    g(&["init", "-q", "-b", "main"]);
+    fs::write(repo.join("README"), "shop\n").unwrap();
+    g(&["add", "-A"]);
+    g(&["commit", "-q", "-m", "init"]);
+    g(&["branch", "dev"]);
+    g(&["branch", "staging"]);
+    g(&["checkout", "-q", "dev"]);
+    fs::write(repo.join("hook.yml"), "deploy\n").unwrap();
+    g(&["add", "-A"]);
+    g(&[
+        "commit",
+        "-q",
+        "-m",
+        "ci: trigger the staging deploy hook (#139)",
+    ]);
+    fs::write(repo.join("fee.txt"), "fee\n").unwrap();
+    g(&["add", "-A"]);
+    g(&[
+        "commit",
+        "-q",
+        "-m",
+        "feat(orders): delivery fee per customer (#140)",
+    ]);
+    g(&["checkout", "-q", "staging"]);
+    g(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "dev",
+        "-m",
+        "Merge pull request #149 from acme/dev",
+    ]);
+    g(&["checkout", "-q", "main"]);
+    g(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "staging",
+        "-m",
+        "Merge pull request #150 from acme/staging",
+    ]);
+    g(&["checkout", "-q", "dev"]);
+    fs::create_dir_all(repo.join("supabase/migrations")).unwrap();
+    fs::write(repo.join("supabase/migrations/001_carts.sql"), "create;\n").unwrap();
+    g(&["add", "-A"]);
+    g(&["commit", "-q", "-m", "feat: saved carts (#141)"]);
+    g(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/shop.git",
+    ]);
+    home
+}
+
+#[test]
+fn releases_come_from_the_project_repository() {
+    let home = home_with_shop_repo("releases");
+    let out = kanbr(&["print", "--tab", "Shop"], Some(&home.root));
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let live = text.split("\nLive (").nth(1).unwrap_or_default();
+    assert!(live.contains("#150 · 2 changes"), "{text}");
+    assert!(
+        live.contains("Shop #139 · Trigger staging deploy hook (shop-deploy-hook)"),
+        "{text}"
+    );
+    assert!(live.contains("[no card] Shop #140"), "{text}");
+    let dev = text.split("\nDev (").nth(1).unwrap_or_default();
+    assert!(dev.starts_with("1)"), "{text}");
+    assert!(
+        dev.contains("[no card] Shop #141 · feat: saved carts"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Promotion PR  https://github.com/acme/shop/pull/150"),
+        "{text}"
+    );
+
+    let notes = stdout(&kanbr(&["notes", "--tab", "Shop"], Some(&home.root)));
+    assert!(
+        notes.contains("\nNew\n- Delivery fee per customer\n"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("Behind the scenes: 1 change (ci)."),
+        "{notes}"
+    );
+
+    let doctor = stdout(&kanbr(&["doctor"], Some(&home.root)));
+    assert!(
+        doctor.contains("project git       Shop: dev staging main; latest release"),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn never_writes_into_a_project_repository() {
+    let home = home_with_shop_repo("repo-readonly");
+    let before = listing(&home.root);
+    for args in [&["print"][..], &["notes"], &["doctor"]] {
+        kanbr(args, Some(&home.root));
+    }
+    assert_eq!(before, listing(&home.root));
+}

@@ -1,0 +1,1086 @@
+//! The interactive board: tabs, the waiting-on-you strip, six columns of
+//! compact cards, and a details view. Read-only.
+
+use std::io;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::dates::now_epoch;
+use crate::firstmate::fingerprint;
+use crate::loader::Loader;
+use crate::model::{Board, Card, Column, Owner, TestBadge, Tone};
+
+const CARD_ROWS: u16 = 3;
+const CARD_SLOT: u16 = CARD_ROWS + 1;
+const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+
+pub enum Msg {
+    Loading,
+    Loaded(Box<Result<Board, String>>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Modal {
+    None,
+    Details(String),
+    Help,
+    Notices,
+}
+
+#[derive(Default)]
+struct Hits {
+    tabs: Vec<(Rect, usize)>,
+    strip: Option<Rect>,
+    columns: Vec<(Rect, usize)>,
+    cards: Vec<(Rect, usize, usize)>,
+}
+
+pub struct App {
+    pub board: Option<Board>,
+    pub error: Option<String>,
+    pub loading: bool,
+    loaded_at: Option<Instant>,
+    pub tab: usize,
+    tab_name: Option<String>,
+    pub col: usize,
+    sel: [usize; 6],
+    sel_id: [Option<String>; 6],
+    scroll: [usize; 6],
+    pub modal: Modal,
+    modal_scroll: u16,
+    home_label: String,
+    hits: Hits,
+    last_click: Option<(Instant, String)>,
+    pub quit: bool,
+    force: bool,
+    now: Option<i64>,
+    /// Column labels from the config, in board order.
+    pub labels: [String; 6],
+}
+
+impl App {
+    pub fn new(home_label: String) -> Self {
+        App {
+            board: None,
+            error: None,
+            loading: true,
+            loaded_at: None,
+            tab: 0,
+            tab_name: None,
+            col: 0,
+            sel: [0; 6],
+            sel_id: Default::default(),
+            scroll: [0; 6],
+            modal: Modal::None,
+            modal_scroll: 0,
+            home_label,
+            hits: Hits::default(),
+            last_click: None,
+            quit: false,
+            force: false,
+            now: None,
+            labels: Column::ALL.map(|c| c.title().to_owned()),
+        }
+    }
+
+    /// An app showing `board`, with a fixed clock.
+    #[cfg(test)]
+    pub fn with_board(board: Board, home_label: String, now: i64) -> Self {
+        let mut app = App::new(home_label);
+        app.now = Some(now);
+        app.apply(Msg::Loaded(Box::new(Ok(board))));
+        app
+    }
+
+    fn now(&self) -> i64 {
+        self.now.unwrap_or_else(now_epoch)
+    }
+
+    pub fn apply(&mut self, msg: Msg) {
+        match msg {
+            Msg::Loading => self.loading = true,
+            Msg::Loaded(res) => {
+                self.loading = false;
+                match *res {
+                    Ok(board) => {
+                        self.board = Some(board);
+                        self.error = None;
+                        self.loaded_at = Some(Instant::now());
+                        self.resync();
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
+    /// Tab labels: All first, then each project with open work.
+    pub fn tabs(&self) -> Vec<(String, usize, bool)> {
+        let mut tabs = vec![("All".to_owned(), 0, false)];
+        if let Some(b) = &self.board {
+            tabs[0].1 = b.cards.len();
+            tabs.extend(
+                b.projects
+                    .iter()
+                    .map(|p| (p.name.clone(), p.count, p.halted)),
+            );
+        }
+        tabs
+    }
+
+    fn tab_project(&self) -> Option<&str> {
+        if self.tab == 0 {
+            return None;
+        }
+        self.board
+            .as_ref()
+            .and_then(|b| b.projects.get(self.tab - 1))
+            .map(|p| p.name.as_str())
+    }
+
+    fn column_cards(&self, col: usize) -> Vec<&Card> {
+        match &self.board {
+            Some(b) => b.column_cards(Column::ALL[col], self.tab_project()),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn selected_card(&self) -> Option<&Card> {
+        self.column_cards(self.col).get(self.sel[self.col]).copied()
+    }
+
+    fn remember(&mut self, col: usize) {
+        let id = self
+            .column_cards(col)
+            .get(self.sel[col])
+            .map(|c| c.id.clone());
+        self.sel_id[col] = id;
+    }
+
+    /// Keeps the tab and selections on the same projects and cards across refreshes.
+    fn resync(&mut self) {
+        let tab_count = self.tabs().len();
+        self.tab = match &self.tab_name {
+            None => 0,
+            Some(name) => self
+                .board
+                .as_ref()
+                .and_then(|b| b.projects.iter().position(|p| &p.name == name))
+                .map_or(0, |i| i + 1),
+        }
+        .min(tab_count.saturating_sub(1));
+        if self.tab == 0 {
+            self.tab_name = None;
+        }
+        for col in 0..6 {
+            let cards = self.column_cards(col);
+            let found = self.sel_id[col]
+                .as_ref()
+                .and_then(|id| cards.iter().position(|c| &c.id == id));
+            self.sel[col] = found
+                .unwrap_or(self.sel[col])
+                .min(cards.len().saturating_sub(1));
+            self.remember(col);
+        }
+        if let Modal::Details(id) = &self.modal
+            && !self
+                .board
+                .as_ref()
+                .is_some_and(|b| b.cards.iter().any(|c| &c.id == id))
+        {
+            self.modal = Modal::None;
+        }
+    }
+
+    pub fn select_tab(&mut self, tab: usize) {
+        if tab >= self.tabs().len() {
+            return;
+        }
+        self.tab = tab;
+        self.tab_name = self.tab_project().map(str::to_owned);
+        self.sel = [0; 6];
+        self.sel_id = Default::default();
+        self.scroll = [0; 6];
+        self.resync();
+    }
+
+    fn move_col(&mut self, delta: isize) {
+        self.col = (self.col as isize + delta).clamp(0, 5) as usize;
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let len = self.column_cards(self.col).len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.sel[self.col] as isize + delta).clamp(0, len as isize - 1);
+        self.sel[self.col] = next as usize;
+        self.remember(self.col);
+    }
+
+    fn select_card(&mut self, id: &str) -> bool {
+        for col in 0..6 {
+            if let Some(i) = self.column_cards(col).iter().position(|c| c.id == id) {
+                self.col = col;
+                self.sel[col] = i;
+                self.remember(col);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Jumps to the next card waiting on the captain, switching to All when
+    /// the current tab has none.
+    pub fn jump_waiting(&mut self) {
+        let Some(board) = &self.board else { return };
+        let project = self.tab_project().map(str::to_owned);
+        let mut waiting: Vec<String> = board
+            .waiting()
+            .iter()
+            .filter(|c| project.as_deref().is_none_or(|p| c.project == p))
+            .map(|c| c.id.clone())
+            .collect();
+        if waiting.is_empty() {
+            if project.is_none() || board.waiting().is_empty() {
+                return;
+            }
+            self.select_tab(0);
+            waiting = self
+                .board
+                .as_ref()
+                .map(|b| b.waiting().iter().map(|c| c.id.clone()).collect())
+                .unwrap_or_default();
+        }
+        let current = self.selected_card().map(|c| c.id.clone());
+        let next = match current.and_then(|id| waiting.iter().position(|w| *w == id)) {
+            Some(i) => (i + 1) % waiting.len(),
+            None => 0,
+        };
+        let id = waiting[next].clone();
+        self.select_card(&id);
+    }
+
+    fn open_details(&mut self) {
+        if let Some(id) = self.selected_card().map(|c| c.id.clone()) {
+            self.modal = Modal::Details(id);
+            self.modal_scroll = 0;
+        }
+    }
+
+    /// Whether a refresh was requested since the last call.
+    pub fn take_force(&mut self) -> bool {
+        std::mem::take(&mut self.force)
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        if self.modal != Modal::None {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.modal_scroll = self.modal_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.modal_scroll = self.modal_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => self.modal_scroll = self.modal_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.modal_scroll = self.modal_scroll.saturating_add(10),
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | '?' | 'n') => {
+                    self.modal = Modal::None
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Left | KeyCode::Char('h') => self.move_col(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_col(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
+            KeyCode::PageUp => self.move_sel(-5),
+            KeyCode::PageDown => self.move_sel(5),
+            KeyCode::Home | KeyCode::Char('g') => self.move_sel(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.move_sel(isize::MAX / 2),
+            KeyCode::Tab => self.select_tab((self.tab + 1) % self.tabs().len()),
+            KeyCode::BackTab => {
+                let n = self.tabs().len();
+                self.select_tab((self.tab + n - 1) % n)
+            }
+            KeyCode::Char(d @ '0'..='9') => {
+                let n = d.to_digit(10).unwrap_or(1) as usize;
+                self.select_tab(if n == 0 { 9 } else { n - 1 });
+            }
+            KeyCode::Enter => self.open_details(),
+            KeyCode::Char('w') => self.jump_waiting(),
+            KeyCode::Char('r') => self.force = true,
+            KeyCode::Char('?') => self.modal = Modal::Help,
+            KeyCode::Char('n') => {
+                let has_notices = self.error.is_some()
+                    || self.board.as_ref().is_some_and(|b| !b.notices.is_empty());
+                if has_notices {
+                    self.modal = Modal::Notices;
+                    self.modal_scroll = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.modal != Modal::None {
+                    self.modal = Modal::None;
+                    return;
+                }
+                if let Some(&(_, tab)) = self.hits.tabs.iter().find(|(r, _)| r.contains(pos)) {
+                    self.select_tab(tab);
+                    return;
+                }
+                if self.hits.strip.is_some_and(|r| r.contains(pos)) {
+                    self.jump_waiting();
+                    return;
+                }
+                if let Some(&(_, col, idx)) =
+                    self.hits.cards.iter().find(|(r, _, _)| r.contains(pos))
+                {
+                    self.col = col;
+                    self.sel[col] = idx;
+                    self.remember(col);
+                    let id = self.sel_id[col].clone().unwrap_or_default();
+                    let double = self
+                        .last_click
+                        .as_ref()
+                        .is_some_and(|(at, last)| *last == id && at.elapsed() < DOUBLE_CLICK);
+                    if double {
+                        self.last_click = None;
+                        self.open_details();
+                    } else {
+                        self.last_click = Some((Instant::now(), id));
+                    }
+                } else if let Some(&(_, col)) =
+                    self.hits.columns.iter().find(|(r, _)| r.contains(pos))
+                {
+                    self.col = col;
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let delta = if m.kind == MouseEventKind::ScrollDown {
+                    1
+                } else {
+                    -1
+                };
+                if self.modal != Modal::None {
+                    self.modal_scroll = (self.modal_scroll as isize + delta).max(0) as u16;
+                } else if let Some(&(_, col)) =
+                    self.hits.columns.iter().find(|(r, _)| r.contains(pos))
+                {
+                    self.col = col;
+                    self.move_sel(delta);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------- rendering
+
+fn text_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Truncates to `max` display cells, ending in `…` when cut.
+pub fn truncate(s: &str, max: usize) -> String {
+    if text_width(s) <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+const PALETTE: [Color; 8] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Yellow,
+    Color::Magenta,
+    Color::LightBlue,
+    Color::LightGreen,
+    Color::LightMagenta,
+    Color::LightCyan,
+];
+
+fn project_color(name: &str) -> Color {
+    let hash = name.bytes().fold(2_166_136_261_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    });
+    PALETTE[hash as usize % PALETTE.len()]
+}
+
+fn tone_color(tone: Tone) -> Color {
+    match tone {
+        Tone::Normal => Color::Gray,
+        Tone::Active => Color::Green,
+        Tone::Attention => Color::Yellow,
+        Tone::Problem => Color::Red,
+        Tone::Finished => Color::Blue,
+        Tone::Muted => Color::DarkGray,
+    }
+}
+
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const SELECTED_BG: Color = Color::Indexed(237);
+
+/// The three lines of a compact card, fitted to `width` cells.
+pub fn card_lines(card: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<'static>> {
+    let greyed = card.paused;
+    let fg = |c: Color| if greyed { Color::DarkGray } else { c };
+    let marker_color = if selected {
+        Color::White
+    } else if card.decision {
+        Color::Red
+    } else {
+        fg(project_color(&card.project))
+    };
+    let marker = || Span::styled("▌", Style::new().fg(marker_color));
+    let inner = width.saturating_sub(1);
+
+    // Line 1: project, PR number, second-mate tag.
+    let mut right = Vec::new();
+    if let Some(n) = card.pr_number {
+        right.push(Span::styled(
+            format!("#{n}"),
+            Style::new().fg(fg(Color::Gray)),
+        ));
+    }
+    if card.is_secondmate() {
+        right.push(Span::raw(" "));
+        right.push(Span::styled(
+            "2nd",
+            Style::new().fg(Color::Black).bg(fg(Color::LightBlue)),
+        ));
+    }
+    let right_w: usize = right.iter().map(|s| text_width(&s.content)).sum();
+    let project = truncate(&card.project, inner.saturating_sub(right_w + 1).max(1));
+    let gap = inner.saturating_sub(text_width(&project) + right_w);
+    let mut l1 = vec![
+        marker(),
+        Span::styled(
+            project,
+            Style::new()
+                .fg(fg(project_color(&card.project)))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(gap)),
+    ];
+    l1.extend(right);
+
+    // Line 2: decision badge, test badge slot, grill tag, dependency badge, title.
+    let mut l2 = vec![marker()];
+    let mut used = 0;
+    let mut badge = |spans: &mut Vec<Span<'static>>, text: &str, style: Style| {
+        used += text_width(text);
+        spans.push(Span::styled(text.to_owned(), style));
+    };
+    if card.decision {
+        badge(
+            &mut l2,
+            "⚑ ",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        );
+    }
+    match card.test {
+        Some(TestBadge::Passed) => badge(&mut l2, "✓ ", Style::new().fg(fg(Color::Green))),
+        Some(TestBadge::Failed) => badge(&mut l2, "✗ ", Style::new().fg(fg(Color::Red))),
+        Some(TestBadge::Running) => badge(&mut l2, "◐ ", Style::new().fg(fg(Color::Yellow))),
+        None => {}
+    }
+    if card.grill {
+        badge(
+            &mut l2,
+            "grill ",
+            Style::new()
+                .fg(fg(Color::Magenta))
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    if !card.blocked_by.is_empty() {
+        badge(&mut l2, "⧗ ", Style::new().fg(fg(Color::Yellow)));
+    }
+    let title_style = if greyed {
+        DIM
+    } else if selected {
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    l2.push(Span::styled(
+        truncate(&card.title, inner.saturating_sub(used)),
+        title_style,
+    ));
+
+    // Line 3: worker model, elapsed time, state.
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    for text in [card.model.clone(), card.elapsed(now)]
+        .into_iter()
+        .flatten()
+    {
+        parts.push(Span::styled(text, DIM));
+        parts.push(Span::styled(" · ", DIM));
+    }
+    let lead: usize = parts.iter().map(|s| text_width(&s.content)).sum();
+    let state = truncate(&card.state, inner.saturating_sub(lead));
+    parts.push(Span::styled(
+        state,
+        Style::new().fg(fg(tone_color(card.tone))),
+    ));
+    let mut l3 = vec![marker()];
+    let mut w = 0;
+    for span in parts {
+        let sw = text_width(&span.content);
+        if w + sw > inner {
+            let rest = truncate(&span.content, inner.saturating_sub(w));
+            l3.push(Span::styled(rest, span.style));
+            break;
+        }
+        w += sw;
+        l3.push(span);
+    }
+
+    let mut lines = vec![Line::from(l1), Line::from(l2), Line::from(l3)];
+    if selected {
+        for l in &mut lines {
+            l.style = Style::new().bg(SELECTED_BG);
+        }
+    }
+    lines
+}
+
+fn centered(area: Rect, pct_w: u16, pct_h: u16, min_w: u16, min_h: u16) -> Rect {
+    let w = (area.width * pct_w / 100).max(min_w).min(area.width);
+    let h = (area.height * pct_h / 100).max(min_h).min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+pub fn render(app: &mut App, f: &mut Frame) {
+    let area = f.area();
+    app.hits = Hits::default();
+    let has_notice =
+        app.error.is_some() || app.board.as_ref().is_some_and(|b| !b.notices.is_empty());
+    let [tabs_area, strip_area, notice_area, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(u16::from(has_notice)),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    render_tabs(app, f, tabs_area);
+    render_strip(app, f, strip_area);
+    if has_notice {
+        render_notice(app, f, notice_area);
+    }
+    if app.board.is_some() {
+        render_columns(app, f, body);
+    } else {
+        let text = match &app.error {
+            Some(e) => vec![
+                Line::styled(
+                    "Kanbr could not read Firstmate",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::raw(e.clone()),
+                Line::raw(""),
+                Line::styled(
+                    "Run `kanbr doctor` to check every surface Kanbr reads.",
+                    DIM,
+                ),
+            ],
+            None => vec![Line::styled(
+                format!("Reading Firstmate at {} …", app.home_label),
+                DIM,
+            )],
+        };
+        let r = centered(body, 80, 40, 20, 5);
+        f.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).centered(),
+            r,
+        );
+    }
+    render_footer(app, f, footer);
+
+    match app.modal.clone() {
+        Modal::None => {}
+        Modal::Details(id) => render_details(app, f, area, &id),
+        Modal::Help => render_help(f, area),
+        Modal::Notices => render_notices(app, f, area),
+    }
+}
+
+fn render_tabs(app: &mut App, f: &mut Frame, area: Rect) {
+    let brand = " Kanbr ";
+    let mut spans = vec![Span::styled(
+        brand,
+        Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let end = area.x + area.width;
+    let mut x = area.x + text_width(brand) as u16;
+    for (i, (name, count, halted)) in app.tabs().into_iter().enumerate() {
+        let key = match i {
+            0..=8 => format!("{}", i + 1),
+            9 => "0".to_owned(),
+            _ => "·".to_owned(),
+        };
+        let label = format!(" {key} {name} {count} ");
+        let w = text_width(&label) as u16;
+        if x + 1 + w > end {
+            spans.push(Span::styled(" …", DIM));
+            break;
+        }
+        let style = if i == app.tab {
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else if halted {
+            DIM
+        } else {
+            Style::new().fg(Color::Gray)
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(label, style));
+        app.hits.tabs.push((Rect::new(x + 1, area.y, w, 1), i));
+        x += 1 + w;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_strip(app: &mut App, f: &mut Frame, area: Rect) {
+    let Some(board) = &app.board else { return };
+    let waiting = board.waiting().len();
+    let line = if waiting > 0 {
+        let here = app
+            .tab_project()
+            .map(|p| board.waiting().iter().filter(|c| c.project == p).count());
+        let mut text = format!(" ⚑ {waiting} waiting on you");
+        if let Some(n) = here {
+            text.push_str(&format!(" ({n} on this tab)"));
+        }
+        text.push_str("  ·  w or click to jump ");
+        app.hits.strip = Some(area);
+        Line::styled(
+            text,
+            Style::new()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::new().bg(Color::Red))
+    } else {
+        Line::styled(" ✓ nothing waiting on you", Style::new().fg(Color::Green))
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_notice(app: &App, f: &mut Frame, area: Rect) {
+    let mut text = String::from(" ⚠ ");
+    let mut total = 0;
+    if let Some(e) = &app.error {
+        let age = app
+            .loaded_at
+            .map(|t| format!(" (showing data from {}s ago)", t.elapsed().as_secs()));
+        text.push_str(&format!("refresh failed: {e}{}", age.unwrap_or_default()));
+        total += 1;
+    }
+    if let Some(b) = &app.board {
+        if app.error.is_none()
+            && let Some(first) = b.notices.first()
+        {
+            text.push_str(first);
+        }
+        total += b.notices.len();
+    }
+    if total > 1 {
+        text.push_str(&format!("  (+{} more, n to list)", total - 1));
+    }
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            truncate(&text, area.width as usize),
+            Style::new().fg(Color::Yellow),
+        )),
+        area,
+    );
+}
+
+fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
+    let now = app.now();
+    let cols = Layout::horizontal([Constraint::Ratio(1, 6); 6]).split(area);
+    for (ci, rect) in cols.iter().enumerate() {
+        let last = ci == 5;
+        let block = if last {
+            Block::new()
+        } else {
+            Block::new().borders(Borders::RIGHT).border_style(DIM)
+        };
+        let inner = block.inner(*rect);
+        f.render_widget(block, *rect);
+        app.hits.columns.push((*rect, ci));
+        if inner.height < 3 || inner.width < 4 {
+            continue;
+        }
+        let cards: Vec<Card> = app.column_cards(ci).into_iter().cloned().collect();
+        let focused = ci == app.col;
+        let title = app.labels[ci].clone();
+        let header_style = if focused {
+            Style::new()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::new().fg(Color::Gray).add_modifier(Modifier::BOLD)
+        };
+        let header = Line::from(vec![
+            Span::styled(format!(" {title}"), header_style),
+            Span::styled(format!(" {}", cards.len()), DIM),
+        ]);
+        f.render_widget(
+            Paragraph::new(header),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(Line::styled("─".repeat(inner.width as usize), DIM)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+        let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2);
+        let fits_all = (list.height + 1) / CARD_SLOT;
+        let visible = if cards.len() as u16 > fits_all {
+            (list.height / CARD_SLOT).max(1)
+        } else {
+            fits_all.max(1)
+        } as usize;
+        let sel = app.sel[ci].min(cards.len().saturating_sub(1));
+        let mut scroll = app.scroll[ci].min(cards.len().saturating_sub(visible));
+        if sel < scroll {
+            scroll = sel;
+        } else if sel >= scroll + visible {
+            scroll = sel + 1 - visible;
+        }
+        app.scroll[ci] = scroll;
+        for (slot, idx) in (scroll..cards.len().min(scroll + visible)).enumerate() {
+            let y = list.y + slot as u16 * CARD_SLOT;
+            let h = CARD_ROWS.min(list.y + list.height - y);
+            let r = Rect::new(list.x, y, list.width, h);
+            let selected = focused && idx == sel;
+            let lines = card_lines(&cards[idx], list.width as usize, selected, now);
+            f.render_widget(Paragraph::new(lines), r);
+            app.hits.cards.push((r, ci, idx));
+        }
+        let below = cards.len().saturating_sub(scroll + visible);
+        if below > 0 || scroll > 0 {
+            let mut t = String::new();
+            if scroll > 0 {
+                t.push_str(&format!(" ▲{scroll}"));
+            }
+            if below > 0 {
+                t.push_str(&format!(" ▼{below} more"));
+            }
+            let y = list.y + list.height - 1;
+            f.render_widget(
+                Paragraph::new(Line::styled(t, DIM)),
+                Rect::new(list.x, y, list.width, 1),
+            );
+        }
+    }
+}
+
+fn render_footer(app: &App, f: &mut Frame, area: Rect) {
+    let keys = " ←→ column  ↑↓ card  enter details  w waiting  1-9 tab  r refresh  ? help  q quit";
+    let status = if app.loading {
+        "refreshing…".to_owned()
+    } else if let Some(t) = app.loaded_at {
+        format!("updated {}s ago", t.elapsed().as_secs())
+    } else {
+        String::new()
+    };
+    let status = format!("{status} ");
+    let room = (area.width as usize).saturating_sub(text_width(&status) + 1);
+    let keys = truncate(keys, room);
+    let gap = (area.width as usize).saturating_sub(text_width(&keys) + text_width(&status));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(keys, DIM),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(status, DIM),
+        ])),
+        area,
+    );
+}
+
+fn modal_block(title: String) -> Block<'static> {
+    Block::bordered()
+        .title(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::new().fg(Color::Cyan))
+}
+
+fn render_details(app: &App, f: &mut Frame, area: Rect, id: &str) {
+    let Some(card) = app
+        .board
+        .as_ref()
+        .and_then(|b| b.cards.iter().find(|c| c.id == id))
+    else {
+        return;
+    };
+    let now = app.now();
+    let label = Style::new().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::styled(
+            card.title.clone(),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let mut row = |k: &str, v: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{k:<13} "), label),
+            Span::raw(v),
+        ]));
+    };
+    row("Project", card.project.clone());
+    row("Column", app.labels[card.column.index()].clone());
+    row("State", card.state.clone());
+    if let Owner::Secondmate(m) = &card.owner {
+        row("Owner", format!("second mate {m}"));
+    }
+    if card.decision {
+        row("Waiting", "on you: a captain decision".to_owned());
+    }
+    if card.grill {
+        row("Grill", "needs a grill".to_owned());
+    }
+    if card.paused {
+        row("Paused", "project halted or item parked".to_owned());
+    }
+    if let Some(e) = card.elapsed(now) {
+        row(
+            if card.column == Column::Building {
+                "Running"
+            } else {
+                "Age"
+            },
+            e,
+        );
+    }
+    if let Some(url) = &card.pr_url {
+        row("PR", url.clone());
+    }
+    for (k, v) in &card.details {
+        row(k, v.clone());
+    }
+    let r = centered(area, 80, 80, 40, 10);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(format!(" {} · esc to close ", card.id)))
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+fn render_help(f: &mut Frame, area: Rect) {
+    let rows = [
+        ("← → / h l", "move between columns"),
+        ("↑ ↓ / j k", "move between cards"),
+        ("pgup pgdn", "move five cards"),
+        ("g G / home end", "first or last card"),
+        ("enter / double-click", "card details"),
+        ("1-9, 0 / tab / click", "switch project tab (1 is All)"),
+        (
+            "w / click the strip",
+            "jump to the next card waiting on you",
+        ),
+        ("n", "list notices (what the board could not show)"),
+        ("r", "refresh now"),
+        ("q", "quit"),
+    ];
+    let mut lines = vec![
+        Line::styled(
+            "Kanbr is read-only: it shows Firstmate's work, it never changes it.",
+            DIM,
+        ),
+        Line::raw(""),
+    ];
+    for (k, v) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{k:<22}"), Style::new().fg(Color::Cyan)),
+            Span::raw(v),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("⚑ ", Style::new().fg(Color::Red)),
+        Span::raw("waiting on you   "),
+        Span::styled("grill ", Style::new().fg(Color::Magenta)),
+        Span::raw("needs a grill   "),
+        Span::styled("⧗ ", Style::new().fg(Color::Yellow)),
+        Span::raw("waits for another task   "),
+        Span::styled("2nd", Style::new().fg(Color::Black).bg(Color::LightBlue)),
+        Span::raw(" second mate's work"),
+    ]));
+    let r = centered(area, 70, 70, 50, 18);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(" Kanbr help · esc to close ".to_owned()))
+            .wrap(Wrap { trim: false }),
+        r,
+    );
+}
+
+fn render_notices(app: &App, f: &mut Frame, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(e) = &app.error {
+        lines.push(Line::styled(
+            format!("• refresh failed: {e}"),
+            Style::new().fg(Color::Red),
+        ));
+    }
+    if let Some(b) = &app.board {
+        lines.extend(b.notices.iter().map(|n| Line::raw(format!("• {n}"))));
+    }
+    let r = centered(area, 80, 60, 40, 8);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(" Notices · esc to close ".to_owned()))
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+// ---------------------------------------------------------------- run loop
+
+/// Polls the Firstmate home cheaply every `interval`, and re-reads the full
+/// snapshot when a source file changed, when `refresh` elapsed, or on demand.
+fn spawn_refresher(loader: Loader, tx: Sender<Msg>, force: Receiver<()>) {
+    let interval = Duration::from_secs(loader.config.interval_secs);
+    let refresh = Duration::from_secs(loader.config.refresh_secs);
+    thread::spawn(move || {
+        let mut last: Option<(u64, Instant)> = None;
+        loop {
+            let fp = fingerprint(&loader.home);
+            let due = last.is_none_or(|(f, at)| f != fp || at.elapsed() >= refresh);
+            if due {
+                if tx.send(Msg::Loading).is_err() {
+                    return;
+                }
+                let res = loader.load();
+                last = Some((fp, Instant::now()));
+                if tx.send(Msg::Loaded(Box::new(res))).is_err() {
+                    return;
+                }
+            }
+            match force.recv_timeout(interval) {
+                Ok(()) => {
+                    while force.try_recv().is_ok() {}
+                    last = None;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+}
+
+pub fn run(loader: Loader) -> io::Result<()> {
+    let home_label = loader.home.display().to_string();
+    let labels = loader.config.labels.clone();
+    let (tx, rx) = mpsc::channel();
+    let (force_tx, force_rx) = mpsc::channel();
+    spawn_refresher(loader, tx, force_rx);
+
+    let mut terminal = ratatui::init();
+    execute!(io::stdout(), EnableMouseCapture)?;
+    let restore_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        restore_hook(info);
+    }));
+
+    let mut app = App::new(home_label);
+    app.labels = labels;
+    let result = (|| -> io::Result<()> {
+        loop {
+            while let Ok(msg) = rx.try_recv() {
+                app.apply(msg);
+            }
+            terminal.draw(|f| render(&mut app, f))?;
+            if event::poll(Duration::from_millis(250))? {
+                match event::read()? {
+                    Event::Key(k) => app.handle_key(k),
+                    Event::Mouse(m) => app.handle_mouse(m),
+                    _ => {}
+                }
+            }
+            if app.take_force() {
+                let _ = force_tx.send(());
+            }
+            if app.quit {
+                return Ok(());
+            }
+        }
+    })();
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    ratatui::restore();
+    result
+}
+
+#[cfg(test)]
+mod tests;

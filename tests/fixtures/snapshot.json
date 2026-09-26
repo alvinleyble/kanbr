@@ -1,0 +1,623 @@
+{
+  "schema": "fm-fleet-snapshot.v1",
+  "generated": "2026-09-26T12:00:00Z",
+  "fm_home": "/fm",
+  "roots": {
+    "fm_root": "/fm",
+    "state": "/fm/state",
+    "data": "/fm/data",
+    "config": "/fm/config",
+    "projects": "/fm/projects"
+  },
+  "backlog": {
+    "path": "/fm/data/backlog.md",
+    "present": true,
+    "records": [
+      {
+        "order": 1,
+        "state": "queued",
+        "structured": true,
+        "id": "fm-sync-guard",
+        "title": "Guard fleet sync against unproven prunes",
+        "repo": "firstmate",
+        "kind": "ship",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": "2026-09-20",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "pr_url": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        }
+      },
+      {
+        "order": 2,
+        "state": "queued",
+        "structured": true,
+        "id": "shop-print-queue",
+        "title": "Print queue for offline devices",
+        "repo": "Shop",
+        "kind": "captain",
+        "hold_reason": "Awaiting a grill with the captain before scoping",
+        "hold_kind": "captain",
+        "hold_until": null,
+        "hold_set": "2026-09-25",
+        "since": "2026-09-25",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": "live",
+        "captain_actionable": true,
+        "pr_url": null,
+        "body_excerpt": "Captain raised it.",
+        "completion": {
+          "verb": null,
+          "date": null
+        }
+      },
+      {
+        "order": 3,
+        "state": "queued",
+        "structured": true,
+        "id": "legacy-capture-fix",
+        "title": "Capture fires on the wrong pages",
+        "repo": "projects/legacy",
+        "kind": "ship",
+        "hold_reason": "Project halted by captain 2026-09-26 - no action until reopened",
+        "hold_kind": "captain",
+        "hold_until": null,
+        "since": "2026-09-10",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": "aged",
+        "captain_actionable": false,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 4,
+        "state": "queued",
+        "structured": true,
+        "id": "legacy-archive-repo",
+        "title": "Archive the legacy repo",
+        "repo": null,
+        "kind": "task",
+        "hold_reason": "Project halted by captain",
+        "hold_kind": "captain",
+        "hold_until": null,
+        "since": "2026-09-08",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": "aged",
+        "captain_actionable": false,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 5,
+        "state": "queued",
+        "structured": true,
+        "id": "kanbr-2-releases",
+        "title": "Kanbr slice 2: releases",
+        "repo": "kanbr",
+        "kind": "ship",
+        "hold_reason": null,
+        "hold_kind": null,
+        "since": "2026-09-26",
+        "blocked_by_ids": [
+          "kanbr-1-board"
+        ],
+        "unresolved_blocker_ids": [
+          "kanbr-1-board"
+        ],
+        "current_role": "queued",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "hold_until": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 6,
+        "state": "queued",
+        "structured": true,
+        "id": "site-launch-post",
+        "title": "Write the launch post",
+        "repo": "Site",
+        "kind": "docs",
+        "hold_reason": "start after launch",
+        "hold_kind": "future",
+        "hold_until": "2026-10-10",
+        "since": "2026-09-24",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 7,
+        "state": "queued",
+        "structured": true,
+        "id": "site-expired-hold",
+        "title": "Refresh screenshots",
+        "repo": "Site",
+        "kind": "docs",
+        "hold_reason": "wait for redesign",
+        "hold_kind": "external",
+        "hold_until": "2026-09-01",
+        "since": "2026-08-20",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 8,
+        "state": "queued",
+        "structured": true,
+        "id": "shop-promote-main",
+        "title": "Promote staging to main",
+        "repo": null,
+        "kind": null,
+        "hold_reason": "Captain consulting users first",
+        "hold_kind": "captain",
+        "hold_until": null,
+        "since": "2026-09-24",
+        "unresolved_blocker_ids": [],
+        "current_role": "queued",
+        "hold_bucket": "live",
+        "captain_actionable": true,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 9,
+        "state": "in_flight",
+        "structured": true,
+        "id": "kanbr-1-board",
+        "title": "Kanbr slice 1: the board",
+        "repo": "kanbr",
+        "kind": "ship",
+        "hold_reason": null,
+        "hold_kind": null,
+        "since": "2026-09-26",
+        "unresolved_blocker_ids": [],
+        "current_role": "worker",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "pr_url": null,
+        "hold_until": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        }
+      },
+      {
+        "order": 10,
+        "state": "in_flight",
+        "structured": true,
+        "id": "shop-held-work",
+        "title": "Paused migration",
+        "repo": "Shop",
+        "kind": "ship",
+        "hold_reason": "waiting on vendor",
+        "hold_kind": "external",
+        "since": "2026-09-22",
+        "unresolved_blocker_ids": [],
+        "current_role": "held",
+        "hold_bucket": null,
+        "captain_actionable": false,
+        "hold_until": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 11,
+        "state": "in_flight",
+        "structured": true,
+        "id": "fm-monthly-program",
+        "title": "Monthly program",
+        "repo": "firstmate",
+        "kind": "program",
+        "unresolved_blocker_ids": [],
+        "current_role": "program",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "pr_url": null
+      },
+      {
+        "order": 12,
+        "state": "done",
+        "structured": true,
+        "id": "shop-deploy-hook",
+        "title": "Trigger staging deploy hook",
+        "repo": "Shop",
+        "kind": "ship",
+        "completion": {
+          "verb": "merged",
+          "date": "2026-09-25"
+        },
+        "pr_url": "https://github.com/acme/shop/pull/139",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 13,
+        "state": "done",
+        "structured": true,
+        "id": "site-hero-copy",
+        "title": "New hero copy",
+        "repo": "Site",
+        "kind": "ship",
+        "completion": {
+          "verb": "merged",
+          "date": "2026-09-24"
+        },
+        "pr_url": "https://github.com/acme/site/pull/12",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 14,
+        "state": "done",
+        "structured": true,
+        "id": "fm-upstream-sync",
+        "title": "Sync with upstream",
+        "repo": "firstmate",
+        "kind": "ship",
+        "completion": {
+          "verb": "merged",
+          "date": "2026-09-26"
+        },
+        "pr_url": "https://github.com/acme/firstmate/pull/9",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 15,
+        "state": "done",
+        "structured": true,
+        "id": "shop-worth-fixing",
+        "title": "Second opinion on two bugs",
+        "repo": "Shop",
+        "kind": "scout",
+        "completion": {
+          "verb": "reported",
+          "date": "2026-09-25"
+        },
+        "pr_url": null,
+        "report_path": "data/shop-worth-fixing/report.md",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 16,
+        "state": "done",
+        "structured": true,
+        "id": "shop-ancient",
+        "title": "Old finished work",
+        "repo": "Shop",
+        "kind": "ship",
+        "completion": {
+          "verb": "merged",
+          "date": "2026-08-01"
+        },
+        "pr_url": "https://github.com/acme/shop/pull/1",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 17,
+        "state": "done",
+        "structured": true,
+        "id": "tool-readme",
+        "title": "Rewrite the README",
+        "repo": "tool",
+        "kind": "ship",
+        "completion": {
+          "verb": "merged",
+          "date": "2026-09-25"
+        },
+        "pr_url": "https://github.com/acme/tool/pull/3",
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 18,
+        "state": "done",
+        "structured": true,
+        "id": "kanbr-0-design",
+        "title": "Kanbr design grill",
+        "repo": "kanbr",
+        "kind": "captain",
+        "completion": {
+          "verb": "done",
+          "date": "2026-09-26"
+        },
+        "pr_url": null,
+        "current_role": "done",
+        "hold_reason": null,
+        "hold_kind": null,
+        "hold_until": null,
+        "since": null,
+        "captain_actionable": false,
+        "unresolved_blocker_ids": []
+      },
+      {
+        "order": 19,
+        "state": "queued",
+        "structured": false,
+        "id": null,
+        "raw": "- a free-form line nobody structured"
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "kanbr-1-board",
+      "kind": "ship",
+      "harness": "claude",
+      "mode": "no-mistakes",
+      "branch": "fm/kanbr-1-board",
+      "project": "/fm/projects/kanbr",
+      "spawn_gen": "s1790424000.46113.533",
+      "paths": {
+        "meta": {
+          "path": "/fm/state/kanbr-1-board.meta",
+          "present": true
+        },
+        "status_log": {
+          "last_event": {
+            "raw": "working [at=1790424100]: setup done"
+          }
+        },
+        "worktree": {
+          "path": "/wt/kanbr",
+          "present": true
+        }
+      },
+      "current_state": {
+        "state": "working",
+        "detail": "harness busy (claude-hook)"
+      },
+      "endpoint": {
+        "target": "default:w4R:p2",
+        "exists": true
+      },
+      "pr": {
+        "url": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "open_decisions": []
+      },
+      "backlog": {
+        "title": "Kanbr slice 1: the board"
+      }
+    },
+    {
+      "id": "shop-force-update",
+      "kind": "ship",
+      "harness": "claude",
+      "project": "/fm/projects/Shop",
+      "spawn_gen": null,
+      "paths": {
+        "meta": {
+          "path": "/fm/state/shop-force-update.meta"
+        },
+        "worktree": null,
+        "status_log": null
+      },
+      "current_state": {
+        "state": "unknown",
+        "detail": "backend target gone: default:w7P:p2"
+      },
+      "endpoint": null,
+      "pr": null,
+      "hints": null,
+      "backlog": null
+    },
+    {
+      "id": "sm-alpha",
+      "kind": "secondmate",
+      "harness": "claude",
+      "project": null,
+      "paths": null,
+      "current_state": {
+        "state": "working"
+      }
+    }
+  ],
+  "scout_reports": [],
+  "main_inventory": {
+    "valid": true,
+    "reason": null,
+    "orphan_in_flight": [],
+    "unstructured_current_count": 1
+  },
+  "secondmate_current": {
+    "registry": {
+      "available": true,
+      "reason": null
+    },
+    "records": [
+      {
+        "id": "sm-alpha",
+        "home": "/mates/alpha",
+        "current": {
+          "state": "active_child_work",
+          "reason": null
+        },
+        "provenance": {
+          "selected": "structured-home",
+          "summary_source": "local-ledger"
+        },
+        "active_children": [
+          {
+            "id": "site-contact-form",
+            "kind": "ship",
+            "state": "working",
+            "repo": "Site",
+            "name": "Contact form validation",
+            "source": "pane",
+            "doing": "writing tests"
+          },
+          {
+            "id": "tool-cli-flags",
+            "kind": "ship",
+            "state": "working",
+            "repo": null,
+            "name": null,
+            "source": "pane",
+            "doing": null
+          }
+        ],
+        "decisions_open": [
+          {
+            "id": "tool-cli-flags",
+            "key": "tool-flags-naming",
+            "verb": "needs-decision",
+            "summary": "Pick flag names",
+            "reason": null,
+            "source": "status"
+          },
+          {
+            "id": "site-pricing-page",
+            "key": "site-pricing-page",
+            "verb": "captain-hold",
+            "summary": "Decide the pricing page",
+            "reason": "captain call",
+            "hold_bucket": "live",
+            "source": "backlog"
+          }
+        ],
+        "holds": null,
+        "queued": [
+          {
+            "id": "site-dark-mode",
+            "title": "Dark mode",
+            "hold_reason": null,
+            "hold_kind": null,
+            "hold_bucket": null,
+            "captain_actionable": false,
+            "repo": "Site",
+            "kind": "ship",
+            "since": "2026-09-21",
+            "unresolved_blocker_ids": [
+              "site-contact-form"
+            ]
+          }
+        ],
+        "landed": [
+          {
+            "id": "site-footer",
+            "title": "Footer links",
+            "kind": "ship",
+            "pr_url": "https://github.com/acme/site/pull/15",
+            "completion": {
+              "verb": "merged",
+              "date": "2026-09-26"
+            }
+          }
+        ],
+        "omitted": [
+          {
+            "surface": "queued",
+            "count": 3
+          }
+        ]
+      },
+      {
+        "id": "sm-beta",
+        "home": null,
+        "current": {
+          "state": "unknown",
+          "reason": "home ledger unreachable"
+        },
+        "provenance": {
+          "selected": "unknown"
+        },
+        "active_children": [],
+        "decisions_open": [],
+        "queued": [],
+        "landed": [],
+        "omitted": []
+      }
+    ],
+    "total": 2,
+    "shown": 2,
+    "truncated": 0
+  },
+  "secondmate_landed": {
+    "records": [],
+    "truncated": [],
+    "unreadable": [],
+    "partial": []
+  }
+}

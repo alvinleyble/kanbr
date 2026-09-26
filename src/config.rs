@@ -1,9 +1,9 @@
 //! User configuration and Firstmate home resolution.
 //!
 //! Kanbr is one public tool that each user adapts through a small config file
-//! instead of a fork: column labels, the branches that back Dev, Staging, and
-//! Live, and the words that mark grills and halted projects all live here with
-//! defaults matching the workflow Kanbr was designed for. The file is optional;
+//! instead of a fork (decision 23): column labels, the branches that back Dev,
+//! Staging, and Live, and the words that mark grills and halted projects all
+//! live here with defaults matching the workflow Kanbr was designed for. The file is optional;
 //! its format is `key = value` lines with `#` comments.
 
 use std::env;
@@ -21,7 +21,9 @@ pub struct Config {
     pub grill_words: Vec<String>,
     /// Words in a hold reason that mark the item's whole project as halted (greyed, paused).
     pub halted_words: Vec<String>,
-    /// How many days finished work stays in Dev, Staging, or Live.
+    /// How many days finished work that git does not place stays on the
+    /// board: merged work whose PR is not in its project's history yet, and
+    /// (while no newer release clears it) finished work with no PR.
     pub finished_days: i64,
     /// Seconds between cheap change checks of the Firstmate home.
     pub interval_secs: u64,
@@ -128,6 +130,15 @@ impl Config {
                         return Err(format!("{}:{}: unknown key `{key}`", path.display(), n + 1));
                     }
                 },
+            }
+        }
+        let b = cfg.branches();
+        for (i, name) in b.iter().enumerate() {
+            if !name.is_empty() && b[i + 1..].contains(name) {
+                return Err(format!(
+                    "{}: dev_branch, staging_branch, and live_branch must be different branches (`{name}` backs two lanes)",
+                    path.display()
+                ));
             }
         }
         Ok(cfg)
@@ -311,6 +322,9 @@ mod tests {
         assert!(Config::parse("colour = red", Path::new("c")).is_err());
         assert!(Config::parse("interval = 0", Path::new("c")).is_err());
         assert!(Config::parse("finished_days = -1", Path::new("c")).is_err());
+        let dup = Config::parse("staging_branch = main", Path::new("c")).unwrap_err();
+        assert!(dup.contains("`main` backs two lanes"), "{dup}");
+        assert!(Config::parse("dev_branch =\nstaging_branch =", Path::new("c")).is_ok());
     }
 
     #[test]

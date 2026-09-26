@@ -10,11 +10,12 @@
 //!
 //! - `state/<id>.meta` for a worker's model and effort;
 //! - `data/projects.md` for canonical project names;
-//! - each project's git refs (read-only `git for-each-ref`) to learn which of
-//!   the configured Dev, Staging, and Live branches the project has.
+//! - each project's git history (read-only; see [`crate::releases`]) to place
+//!   merged work in Dev, Staging, or Live and describe releases;
+//! - optionally `gh pr view`, for a merged PR its history does not name.
 //!
 //! Every surface is listed in [`SURFACES`] and verified by `kanbr doctor`.
-//! Kanbr never writes to a Firstmate file.
+//! Kanbr never writes to a Firstmate file or a project repository.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -47,8 +48,12 @@ pub const SURFACES: &[(&str, &str)] = &[
     ),
     ("data/projects.md", "registered project names"),
     (
-        "projects/<name> git refs",
-        "which configured Dev, Staging, and Live branches a project has",
+        "projects/<name> git history",
+        "Dev, Staging, Live branches; how far each merged change has reached; releases (read-only, as of the last fetch)",
+    ),
+    (
+        "gh pr view (optional)",
+        "the commit a merged PR landed as, when its merge message has no PR number",
     ),
 ];
 
@@ -195,65 +200,12 @@ pub fn read_projects_registry(home: &Path) -> Result<Vec<String>, String> {
 }
 
 /// Which release lanes a project uses: whether it has the branch configured
-/// to back Dev, Staging, and Live.
+/// to back Dev, Staging, and Live (locally or on any remote).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Lanes {
     pub dev: bool,
     pub staging: bool,
     pub live: bool,
-}
-
-/// The branch name of a local (`refs/heads/<b>`) or remote-tracking
-/// (`refs/remotes/<remote>/<b>`) ref.
-fn branch_of(refname: &str) -> Option<&str> {
-    if let Some(b) = refname.strip_prefix("refs/heads/") {
-        return Some(b);
-    }
-    refname
-        .strip_prefix("refs/remotes/")?
-        .split_once('/')
-        .map(|(_, b)| b)
-}
-
-/// Lanes from ref names, given the `[dev, staging, live]` branch names. An
-/// empty branch name backs no lane.
-pub fn lanes_from_refs(refs: &str, branches: [&str; 3]) -> Lanes {
-    let has = |branch: &str| {
-        !branch.is_empty()
-            && refs
-                .lines()
-                .filter_map(|r| branch_of(r.trim()))
-                .any(|b| b == branch)
-    };
-    Lanes {
-        dev: has(branches[0]),
-        staging: has(branches[1]),
-        live: has(branches[2]),
-    }
-}
-
-/// Reads a repository's local and remote-tracking branch names, read-only.
-/// `None` when the path is not a readable git repository.
-pub fn read_lanes(repo: &Path, branches: [&str; 3]) -> Option<Lanes> {
-    if !repo.is_dir() {
-        return None;
-    }
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo)
-        .args([
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads",
-            "refs/remotes",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match run_bounded(cmd, Duration::from_secs(5)) {
-        Ok((Some(status), out, _)) if status.success() => Some(lanes_from_refs(&out, branches)),
-        _ => None,
-    }
 }
 
 /// A cheap fingerprint of the files the snapshot is derived from, so the
@@ -319,51 +271,6 @@ mod tests {
         );
     }
 
-    const BRANCHES: [&str; 3] = ["dev", "staging", "main"];
-
-    #[test]
-    fn lanes_from_ref_names() {
-        let refs = "refs/heads/dev\nrefs/heads/main\nrefs/remotes/origin/dev\nrefs/remotes/origin/main\nrefs/remotes/origin/staging\n";
-        assert_eq!(
-            lanes_from_refs(refs, BRANCHES),
-            Lanes {
-                dev: true,
-                staging: true,
-                live: true
-            }
-        );
-        assert_eq!(
-            lanes_from_refs("refs/heads/main\nrefs/remotes/origin/devtools\n", BRANCHES),
-            Lanes {
-                dev: false,
-                staging: false,
-                live: true
-            }
-        );
-        assert_eq!(
-            lanes_from_refs("refs/remotes/upstream/dev\nrefs/heads/master\n", BRANCHES),
-            Lanes {
-                dev: true,
-                staging: false,
-                live: false
-            }
-        );
-    }
-
-    #[test]
-    fn configured_branch_names_back_lanes() {
-        let refs = "refs/heads/master\nrefs/remotes/origin/release/prod\nrefs/heads/dev\n";
-        assert_eq!(
-            lanes_from_refs(refs, ["", "release/prod", "master"]),
-            Lanes {
-                dev: false,
-                staging: true,
-                live: true
-            },
-            "an empty branch backs no lane even when a matching ref exists"
-        );
-    }
-
     #[test]
     fn fingerprint_tracks_backlog_and_task_files() {
         let dir = std::env::temp_dir().join(format!("kanbr-fp-{}", std::process::id()));
@@ -380,13 +287,5 @@ mod tests {
         fs::write(dir.join("data/backlog.md"), "ab").unwrap();
         assert_ne!(b, fingerprint(&dir), "a backlog edit counts");
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn missing_repo_has_no_lanes() {
-        assert_eq!(
-            read_lanes(Path::new("/definitely/not/a/repo"), BRANCHES),
-            None
-        );
     }
 }

@@ -23,9 +23,8 @@ pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// The `YYYY-MM-DD` form of an epoch.
-#[cfg(test)]
-pub fn format_date(epoch: i64) -> String {
+/// The civil `(year, month, day)` of an epoch (UTC).
+fn civil(epoch: i64) -> (i64, i64, i64) {
     let z = epoch.div_euclid(DAY) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -34,8 +33,35 @@ pub fn format_date(epoch: i64) -> String {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// The `YYYY-MM-DD` form of an epoch.
+#[cfg(test)]
+pub fn format_date(epoch: i64) -> String {
+    let (y, m, d) = civil(epoch);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `10 Sep`: a compact day for column headers.
+pub fn format_day(epoch: i64) -> String {
+    let (_, m, d) = civil(epoch);
+    format!("{d} {}", MONTHS[(m - 1) as usize])
+}
+
+/// `10 Sep 2026`: a day for release notes and details.
+pub fn format_long_day(epoch: i64) -> String {
+    let (y, m, d) = civil(epoch);
+    format!("{d} {} {y}", MONTHS[(m - 1) as usize])
+}
+
+/// How long ago, compactly: `45s ago`, `3h05m ago`, `2d4h ago`.
+pub fn format_ago(then: i64, now: i64) -> String {
+    format!("{} ago", format_elapsed(now - then))
 }
 
 /// Parses `YYYY-MM-DD` or an ISO `YYYY-MM-DDTHH:MM:SSZ` timestamp to an epoch.
@@ -106,6 +132,18 @@ pub fn format_age_days(then: i64, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn day_labels() {
+        let e = parse_date("2026-09-10T08:00:00Z").unwrap();
+        assert_eq!(format_day(e), "10 Sep");
+        assert_eq!(format_long_day(e), "10 Sep 2026");
+        assert_eq!(
+            format_long_day(parse_date("2027-01-02").unwrap()),
+            "2 Jan 2027"
+        );
+        assert_eq!(format_ago(e, e + 7260), "2h01m ago");
+    }
 
     #[test]
     fn civil_round_trip() {

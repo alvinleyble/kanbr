@@ -1,20 +1,49 @@
 use super::*;
 use crate::dates::parse_date;
+use crate::releases::{Change, LaneRef, Release};
 use std::collections::HashMap;
 
 const FIXTURE: &str = include_str!("../../tests/fixtures/snapshot.json");
 
 pub(crate) struct FakeEnv {
     pub metas: HashMap<PathBuf, Meta>,
-    pub lanes: HashMap<PathBuf, Lanes>,
+    pub gits: HashMap<PathBuf, ProjectGit>,
+    /// PR URL -> the commit the forge says it merged as.
+    pub forge: HashMap<String, String>,
 }
 
 impl Env for FakeEnv {
     fn meta(&self, path: &Path) -> Option<Meta> {
         self.metas.get(path).cloned()
     }
-    fn lanes(&self, repo: &Path) -> Option<Lanes> {
-        self.lanes.get(repo).copied()
+    fn git(&self, repo: &Path) -> Option<Result<Arc<ProjectGit>, String>> {
+        self.gits.get(repo).map(|g| Ok(Arc::new(g.clone())))
+    }
+    fn merged_commit(&self, pr_url: &str) -> Option<String> {
+        self.forge.get(pr_url).cloned()
+    }
+}
+
+/// A repository with the given lanes and no history.
+pub(crate) fn lanes_only(lanes: Lanes) -> ProjectGit {
+    let refs = [
+        (lanes.dev, Column::Dev, "dev"),
+        (lanes.staging, Column::Staging, "staging"),
+        (lanes.live, Column::Live, "main"),
+    ]
+    .into_iter()
+    .filter(|(used, _, _)| *used)
+    .map(|(_, column, b)| LaneRef {
+        column,
+        branch: b.to_owned(),
+        refname: format!("refs/remotes/origin/{b}"),
+        tip: format!("{b}-tip"),
+    })
+    .collect();
+    ProjectGit {
+        lanes,
+        refs,
+        ..ProjectGit::default()
     }
 }
 
@@ -28,33 +57,116 @@ pub(crate) fn fake_env() -> FakeEnv {
         PathBuf::from("/mates/alpha/state/site-contact-form.meta"),
         crate::firstmate::parse_meta("model=gpt-5.5\nharness=codex\nspawn_gen=s1790420000.1.1\n"),
     );
-    let mut lanes = HashMap::new();
-    lanes.insert(
+    let mut gits = HashMap::new();
+    gits.insert(
         PathBuf::from("/fm"),
-        Lanes {
+        lanes_only(Lanes {
             dev: false,
             staging: false,
             live: true,
-        },
+        }),
     );
-    lanes.insert(
+    gits.insert(
         PathBuf::from("/fm/projects/Shop"),
-        Lanes {
+        lanes_only(Lanes {
             dev: true,
             staging: true,
             live: true,
-        },
+        }),
     );
-    lanes.insert(
+    gits.insert(
         PathBuf::from("/fm/projects/Site"),
-        Lanes {
+        lanes_only(Lanes {
             dev: true,
             staging: false,
             live: true,
-        },
+        }),
     );
-    lanes.insert(PathBuf::from("/fm/projects/tool"), Lanes::default());
-    FakeEnv { metas, lanes }
+    gits.insert(
+        PathBuf::from("/fm/projects/tool"),
+        lanes_only(Lanes::default()),
+    );
+    FakeEnv {
+        metas,
+        gits,
+        forge: HashMap::new(),
+    }
+}
+
+fn shop_change(n: u64, title: &str, column: Column, in_release: bool) -> Change {
+    Change {
+        commit: format!("c{n:0>39}"),
+        home: Column::Dev,
+        column,
+        in_release,
+        pr: Some(n),
+        title: title.to_owned(),
+        time: parse_date("2026-09-24T10:00:00Z").unwrap(),
+    }
+}
+
+/// Shop's history: a release (#150) of four changes, one of them the
+/// Firstmate card shop-deploy-hook (#139), one change waiting in Staging, and
+/// an earlier release.
+pub(crate) fn shop_git() -> ProjectGit {
+    let mut g = lanes_only(Lanes {
+        dev: true,
+        staging: true,
+        live: true,
+    });
+    g.web = Some("https://github.com/acme/shop".into());
+    g.changes = vec![
+        shop_change(
+            139,
+            "fix: stop double saves on slow networks",
+            Column::Live,
+            true,
+        ),
+        shop_change(
+            141,
+            "feat(orders): persistent delivery fee per customer",
+            Column::Live,
+            true,
+        ),
+        shop_change(
+            142,
+            "Receipt printing waits for the printer",
+            Column::Live,
+            true,
+        ),
+        shop_change(143, "docs: explain the fee", Column::Live, true),
+        shop_change(144, "feat: saved carts", Column::Staging, false),
+        shop_change(100, "Old release", Column::Live, false),
+        shop_change(1, "Old finished work", Column::Live, false),
+    ];
+    for (i, c) in g.changes.iter().enumerate() {
+        g.by_pr.insert(c.pr.unwrap(), Role::Change(i));
+        g.by_commit.insert(c.commit.clone(), Role::Change(i));
+    }
+    g.by_pr.insert(150, Role::Promotion);
+    g.release = Some(Release {
+        commit: "r".repeat(40),
+        time: parse_date("2026-09-25T10:00:00Z").unwrap(),
+        pr: Some(150),
+        title: "Promote staging to main".into(),
+        version: Some("1.2.1".into()),
+        fast_forward: false,
+        known: true,
+    });
+    g.migrations = vec!["supabase/migrations/20260926_fee.sql".into()];
+    g.fetched = Some(parse_date("2026-09-26T09:00:00Z").unwrap());
+    g
+}
+
+pub(crate) fn release_env() -> FakeEnv {
+    let mut env = fake_env();
+    env.gits
+        .insert(PathBuf::from("/fm/projects/Shop"), shop_git());
+    env
+}
+
+pub(crate) fn release_board() -> Board {
+    board_with(&serde_json::from_str(FIXTURE).unwrap(), &release_env())
 }
 
 pub(crate) fn registry() -> Vec<String> {
@@ -73,14 +185,17 @@ pub(crate) fn fixture_board() -> Board {
 }
 
 fn board_from(snap: &Value) -> Board {
-    let env = fake_env();
+    board_with(snap, &fake_env())
+}
+
+fn board_with(snap: &Value, env: &FakeEnv) -> Board {
     let config = Config::default();
     let registry = registry();
     let ctx = Context {
         registry: &registry,
         config: &config,
         now: now(),
-        env: &env,
+        env,
     };
     build_board(snap, &ctx)
 }
@@ -277,13 +392,13 @@ fn unreadable_repository_assumes_only_the_last_lane() {
 fn configured_branches_move_landing_lane() {
     let snap: Value = serde_json::from_str(FIXTURE).unwrap();
     let mut env = fake_env();
-    env.lanes.insert(
+    env.gits.insert(
         PathBuf::from("/fm/projects/Shop"),
-        Lanes {
+        lanes_only(Lanes {
             dev: false,
             staging: true,
             live: true,
-        },
+        }),
     );
     let config = Config {
         dev_branch: String::new(),
@@ -461,4 +576,182 @@ fn main_worker_pending_decision_waits_on_captain_in_building() {
     assert_eq!(c.state, "needs decision");
     assert!(c.decision);
     assert!(b.waiting().iter().any(|w| w.id == "kanbr-1-board"));
+}
+
+#[test]
+fn merged_cards_sit_in_the_lane_their_change_reached() {
+    let b = release_board();
+    let c = card(&b, "shop-deploy-hook");
+    assert_eq!(c.column, Column::Live);
+    assert!(c.in_release && !c.outside);
+    assert_eq!(
+        c.change_title.as_deref(),
+        Some("fix: stop double saves on slow networks")
+    );
+    assert!(
+        c.details
+            .iter()
+            .any(|(k, v)| *k == "Landed" && v == "c000000 on dev"),
+        "{:?}",
+        c.details
+    );
+    assert!(
+        !has(&b, "shop-ancient"),
+        "released before the latest release"
+    );
+    assert!(
+        !b.notices.iter().any(|n| n.contains("shop-deploy-hook")),
+        "{:?}",
+        b.notices
+    );
+}
+
+#[test]
+fn changes_without_a_firstmate_card_are_plain_grey_cards() {
+    let b = release_board();
+    let c = card(&b, "Shop#141");
+    assert!(c.outside);
+    assert_eq!(c.tone, Tone::Muted);
+    assert_eq!(
+        c.title,
+        "feat(orders): persistent delivery fee per customer"
+    );
+    assert_eq!(c.column, Column::Live);
+    assert!(c.in_release);
+    assert_eq!(
+        c.pr_url.as_deref(),
+        Some("https://github.com/acme/shop/pull/141")
+    );
+    assert_eq!(card(&b, "Shop#144").column, Column::Staging);
+    assert!(!has(&b, "Shop#100"), "an earlier release is cleared");
+    assert!(!has(&b, "Shop#139"), "tracked by shop-deploy-hook");
+    assert!(!has(&b, "Shop#1"), "released long ago");
+}
+
+#[test]
+fn live_holds_only_the_latest_release() {
+    let b = release_board();
+    let ids: Vec<&str> = b
+        .release_cards(Some("Shop"))
+        .iter()
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(ids.len(), 4, "{ids:?}");
+    let live = b.column_cards(Column::Live, Some("Shop"));
+    assert!(live.first().unwrap().in_release, "release cards come first");
+    let rel = b.release("Shop").unwrap();
+    let live_rel = rel.live.as_ref().unwrap();
+    assert_eq!(live_rel.pr, Some(150));
+    assert_eq!(
+        live_rel.pr_url.as_deref(),
+        Some("https://github.com/acme/shop/pull/150")
+    );
+    assert_eq!(live_rel.version.as_deref(), Some("1.2.1"));
+    assert_eq!(rel.refs.last().unwrap().1, "origin/main");
+}
+
+#[test]
+fn promotion_prs_are_release_events_not_cards() {
+    let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    let mut rec = snap["backlog"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "shop-deploy-hook")
+        .unwrap()
+        .clone();
+    rec["id"] = "shop-promote-main-done".into();
+    rec["pr_url"] = "https://github.com/acme/shop/pull/150".into();
+    snap["backlog"]["records"].as_array_mut().unwrap().push(rec);
+    let b = board_with(&snap, &release_env());
+    assert!(!has(&b, "shop-promote-main-done"));
+}
+
+#[test]
+fn unmerged_finished_work_stays_in_live_until_the_next_release() {
+    let b = release_board();
+    let c = card(&b, "shop-worth-fixing");
+    assert_eq!(c.column, Column::Live);
+    assert!(!c.in_release, "a report is not part of the release");
+    let mut env = release_env();
+    let shop = env.gits.get_mut(Path::new("/fm/projects/Shop")).unwrap();
+    shop.release.as_mut().unwrap().time = parse_date("2026-09-26T08:00:00Z").unwrap();
+    let b = board_with(&serde_json::from_str(FIXTURE).unwrap(), &env);
+    assert!(!has(&b, "shop-worth-fixing"), "a newer release clears it");
+}
+
+#[test]
+fn the_forge_finds_a_pr_the_merge_messages_do_not_name() {
+    let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    for r in snap["backlog"]["records"].as_array_mut().unwrap() {
+        if r["id"] == "shop-deploy-hook" {
+            r["pr_url"] = "https://github.com/acme/shop/pull/160".into();
+        }
+    }
+    let mut env = release_env();
+    env.forge.insert(
+        "https://github.com/acme/shop/pull/160".into(),
+        format!("c{:0>39}", 144),
+    );
+    let b = board_with(&snap, &env);
+    let c = card(&b, "shop-deploy-hook");
+    assert_eq!(c.column, Column::Staging);
+    assert!(!has(&b, "Shop#144"), "the change is the Firstmate card");
+}
+
+#[test]
+fn a_pr_missing_from_git_falls_back_and_says_so() {
+    let b = fixture_board();
+    let c = card(&b, "shop-deploy-hook");
+    assert_eq!(c.column, Column::Dev);
+    assert!(
+        c.details.iter().any(|(k, _)| *k == "Git"),
+        "{:?}",
+        c.details
+    );
+    assert!(
+        b.notices
+            .iter()
+            .any(|n| n.contains("not found in their project's git history")
+                && n.contains("shop-deploy-hook")),
+        "{:?}",
+        b.notices
+    );
+}
+
+#[test]
+fn another_repositorys_pr_number_is_not_matched() {
+    let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    for r in snap["backlog"]["records"].as_array_mut().unwrap() {
+        if r["id"] == "shop-deploy-hook" {
+            r["pr_url"] = "https://github.com/upstream/shop/pull/141".into();
+        }
+    }
+    let b = board_with(&snap, &release_env());
+    assert!(has(&b, "Shop#141"), "#141 of acme/shop stays its own card");
+    assert_eq!(card(&b, "shop-deploy-hook").column, Column::Dev);
+}
+
+#[test]
+fn halted_projects_get_no_git_only_cards() {
+    let mut env = release_env();
+    let mut legacy = shop_git();
+    legacy.web = Some("https://github.com/acme/legacy".into());
+    env.gits
+        .insert(PathBuf::from("/fm/projects/legacy"), legacy);
+    let b = board_with(&serde_json::from_str(FIXTURE).unwrap(), &env);
+    assert!(!b.cards.iter().any(|c| c.project == "legacy" && c.outside));
+    assert!(b.release("legacy").is_none());
+    assert!(b.release("Shop").is_some());
+}
+
+#[test]
+fn only_projects_on_the_board_are_read_for_releases() {
+    let b = release_board();
+    let names: Vec<&str> = b.releases.iter().map(|r| r.project.as_str()).collect();
+    assert!(
+        names.contains(&"Shop") && names.contains(&"Site"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"tool"), "tool uses no lane: {names:?}");
 }

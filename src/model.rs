@@ -7,13 +7,17 @@
 //! - **Ready**: queued and not held. A queued item blocked by another task stays
 //!   here with a dependency badge.
 //! - **Building**: work in flight (every live worker).
-//! - **Dev / Staging / Live**: in this slice, only just-finished work. A
-//!   project uses a lane when it has the branch configured to back it (default
-//!   `dev`, `staging`, `main`); a project missing a branch never shows cards in
-//!   that column, so the All tab lines up. Merged work lands in the first lane
-//!   its project uses; finished work with no PR (reports, local tasks) is shown
-//!   in the last. Where the repository cannot be read, only the last configured
-//!   lane is assumed. Deriving placement from git reachability is slice 2.
+//! - **Dev / Staging / Live** (decisions 4, 6, 7, 8, 19; slice 2): derived
+//!   from git by [`crate::releases`]. A project uses a lane when it has the
+//!   branch configured to back it (default `dev`, `staging`, `main`); a project
+//!   missing a branch never shows cards in that column, so the All tab lines
+//!   up. Each merged card keeps its PR and sits in the furthest lane its change
+//!   has reached; Live holds only the latest production release. Merged
+//!   changes with no Firstmate card (hand-opened PRs, direct commits) are plain
+//!   grey cards titled from the PR or commit. Finished work with no PR
+//!   (reports, local tasks) is shown in the project's last lane until its next
+//!   release. Where the repository cannot be read, or a merged PR is not in
+//!   it yet, merged work falls back to the first lane for `finished_days`.
 //! - A captain decision is a red badge on the card, which stays in its real column.
 //! - Registered second mates' work is mixed into the same projects and columns
 //!   with a `2nd` tag.
@@ -21,6 +25,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -28,6 +33,7 @@ use crate::config::Config;
 use crate::dates::{DAY, format_age_days, format_elapsed, parse_date, parse_generation};
 use crate::firstmate::{Lanes, Meta};
 use crate::json::{arr_at, bool_at, get, i64_at, str_at, string_at, strings_at};
+use crate::releases::{Change, ProjectGit, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Column {
@@ -142,6 +148,12 @@ pub struct Card {
     pub tone: Tone,
     /// Label/value pairs for the details view.
     pub details: Vec<(&'static str, String)>,
+    /// A merged change with no Firstmate card (a plain grey card).
+    pub outside: bool,
+    /// Part of its project's latest Live release.
+    pub in_release: bool,
+    /// The PR title or commit subject from git, for release notes.
+    pub change_title: Option<String>,
     hold_reason: Option<String>,
     hold_kind: Option<String>,
     order: usize,
@@ -169,6 +181,46 @@ pub struct ProjectTab {
     pub halted: bool,
 }
 
+/// A project's latest production release: the last landing on its Live branch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveRelease {
+    pub time: i64,
+    pub pr: Option<u64>,
+    pub pr_url: Option<String>,
+    pub title: String,
+    /// The app version on the Live branch, where the project has one.
+    pub version: Option<String>,
+    /// The Live branch was fast-forwarded to a lower lane's commit.
+    pub fast_forward: bool,
+    /// Where the release starts is known, so its changes are.
+    pub known: bool,
+}
+
+/// Release state for a project on the board.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectRelease {
+    pub project: String,
+    pub lanes: Lanes,
+    /// The ref each used lane is read from, such as `origin/main`.
+    pub refs: Vec<(Column, String)>,
+    pub live: Option<LiveRelease>,
+    /// Database migrations in Staging that Live does not have yet.
+    pub migrations: Vec<String>,
+    /// When the clone last fetched: the board reflects that moment.
+    pub fetched: Option<i64>,
+}
+
+impl ProjectRelease {
+    pub fn uses(&self, column: Column) -> bool {
+        match column {
+            Column::Dev => self.lanes.dev,
+            Column::Staging => self.lanes.staging,
+            Column::Live => self.lanes.live,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Board {
     pub cards: Vec<Card>,
@@ -177,6 +229,8 @@ pub struct Board {
     pub home: Option<String>,
     /// Things the board could not show, stated so an absence is never silent.
     pub notices: Vec<String>,
+    /// Release state of each project on the board whose repository was read.
+    pub releases: Vec<ProjectRelease>,
 }
 
 impl Board {
@@ -192,12 +246,39 @@ impl Board {
     pub fn waiting(&self) -> Vec<&Card> {
         self.cards.iter().filter(|c| c.decision).collect()
     }
+
+    pub fn release(&self, project: &str) -> Option<&ProjectRelease> {
+        self.releases.iter().find(|r| r.project == project)
+    }
+
+    /// Release state for the whole board, or one project.
+    pub fn releases_in(&self, project: Option<&str>) -> Vec<&ProjectRelease> {
+        self.releases
+            .iter()
+            .filter(|r| project.is_none_or(|p| r.project == p))
+            .collect()
+    }
+
+    /// The cards of a project's latest Live release (or of every project's).
+    pub fn release_cards(&self, project: Option<&str>) -> Vec<&Card> {
+        self.column_cards(Column::Live, project)
+            .into_iter()
+            .filter(|c| c.in_release)
+            .collect()
+    }
 }
 
 /// File and git access the mapping needs; faked in tests.
 pub trait Env {
     fn meta(&self, path: &Path) -> Option<Meta>;
-    fn lanes(&self, repo: &Path) -> Option<Lanes>;
+    /// A project's release state from its repository: `None` when `repo` is
+    /// not a git checkout, an error when its history cannot be read.
+    fn git(&self, repo: &Path) -> Option<Result<Arc<ProjectGit>, String>>;
+    /// The commit a merged PR landed as, from the forge, for a PR its
+    /// project's history does not name.
+    fn merged_commit(&self, _pr_url: &str) -> Option<String> {
+        None
+    }
 }
 
 pub struct Context<'a> {
@@ -212,6 +293,7 @@ pub fn build_board(snapshot: &Value, ctx: &Context) -> Board {
     let mut b = Builder::new(snapshot, ctx);
     b.main_home();
     b.secondmates();
+    b.outside_cards();
     b.finish()
 }
 
@@ -246,6 +328,71 @@ pub fn short_model(model: Option<&str>, harness: Option<&str>) -> Option<String>
     }
 }
 
+/// `refs/remotes/origin/main` reads `origin/main`; `refs/heads/main` reads `main`.
+fn short_ref(refname: &str) -> String {
+    refname
+        .strip_prefix("refs/remotes/")
+        .or_else(|| refname.strip_prefix("refs/heads/"))
+        .unwrap_or(refname)
+        .to_owned()
+}
+
+/// `abc1234 on dev`: where a change first landed.
+fn landed(g: &ProjectGit, c: &Change) -> String {
+    let branch = g
+        .refs
+        .iter()
+        .find(|r| r.column == c.home)
+        .map_or("?", |r| r.branch.as_str());
+    format!("{} on {branch}", c.commit.get(..7).unwrap_or(&c.commit))
+}
+
+/// A plain grey card for a merged change with no Firstmate card.
+fn outside_card(project: &str, g: &ProjectGit, c: &Change) -> Card {
+    let short = c.commit.get(..7).unwrap_or(&c.commit);
+    let mut details = vec![
+        ("Source", "git history: no Firstmate card".to_owned()),
+        ("Landed", landed(g, c)),
+    ];
+    if c.in_release {
+        details.push(("Release", "in the latest Live release".to_owned()));
+    }
+    Card {
+        id: match c.pr {
+            Some(n) => format!("{project}#{n}"),
+            None => format!("{project}@{short}"),
+        },
+        title: c.title.clone(),
+        project: project.to_owned(),
+        owner: Owner::Main,
+        column: c.column,
+        pr_number: c.pr,
+        pr_url: c.pr.and_then(|n| g.pr_url(n)),
+        decision: false,
+        grill: false,
+        paused: false,
+        blocked_by: Vec::new(),
+        test: None,
+        model: None,
+        since: Some(c.time),
+        since_is_date: true,
+        state: if c.pr.is_some() {
+            "merged"
+        } else {
+            "committed"
+        }
+        .to_owned(),
+        tone: Tone::Muted,
+        details,
+        outside: true,
+        in_release: c.in_release,
+        change_title: Some(c.title.clone()),
+        hold_reason: None,
+        hold_kind: None,
+        order: 0,
+    }
+}
+
 struct Builder<'a> {
     snap: &'a Value,
     ctx: &'a Context<'a>,
@@ -254,9 +401,25 @@ struct Builder<'a> {
     projects_dir: Option<PathBuf>,
     cards: Vec<Card>,
     notices: Vec<String>,
-    lanes_cache: HashMap<PathBuf, Lanes>,
+    /// Release state per project, read once per build.
+    gits: HashMap<String, Option<Arc<ProjectGit>>>,
+    /// Changes shown as Firstmate cards, per project (by index into its changes).
+    claimed: HashMap<String, HashSet<usize>>,
+    /// Second-mate homes, for projects cloned only there.
+    mate_homes: Vec<PathBuf>,
     /// Projects whose finished cards were hidden because they use no lane.
     laneless: Vec<String>,
+    /// Merged cards whose PR is not in their project's history yet.
+    unfetched: Vec<String>,
+    releases: Vec<ProjectRelease>,
+}
+
+/// Where a merged card's PR sits in its project's history.
+enum Found {
+    Change(usize),
+    /// A promotion or back-merge PR: shown through the release headers.
+    Promotion,
+    Missing,
 }
 
 impl<'a> Builder<'a> {
@@ -275,8 +438,15 @@ impl<'a> Builder<'a> {
             projects_dir,
             cards: Vec::new(),
             notices: Vec::new(),
-            lanes_cache: HashMap::new(),
+            gits: HashMap::new(),
+            claimed: HashMap::new(),
+            mate_homes: arr_at(snap, "secondmate_current.records")
+                .iter()
+                .filter_map(|m| str_at(m, "home").map(PathBuf::from))
+                .collect(),
             laneless: Vec::new(),
+            unfetched: Vec::new(),
+            releases: Vec::new(),
         }
     }
 
@@ -327,33 +497,77 @@ impl<'a> Builder<'a> {
         best.map(|(_, n)| n).unwrap_or_else(|| "other".to_owned())
     }
 
-    /// The lanes a project uses, from its repository's branches. When no
-    /// repository can be read, only the last configured lane is assumed.
-    fn lanes_for(&mut self, project: &str, owner_home: Option<&Path>) -> Lanes {
+    /// A project's release state, from the first readable clone: the
+    /// Firstmate home for firstmate, then the projects directory, then the
+    /// owning and other second mates' homes.
+    fn git_for(&mut self, project: &str, owner_home: Option<&Path>) -> Option<Arc<ProjectGit>> {
+        if let Some(g) = self.gits.get(project) {
+            return g.clone();
+        }
         let mut candidates = Vec::new();
         if project == "firstmate" {
             candidates.extend(self.fm_root.clone());
         }
-        if let Some(home) = owner_home {
-            candidates.push(home.join("projects").join(project));
-        }
         if let Some(dir) = &self.projects_dir {
             candidates.push(dir.join(project));
         }
+        candidates.extend(owner_home.map(|h| h.join("projects").join(project)));
+        candidates.extend(
+            self.mate_homes
+                .iter()
+                .map(|h| h.join("projects").join(project)),
+        );
+        let mut found = None;
         for path in candidates {
-            if let Some(l) = self.lanes_cache.get(&path) {
-                return *l;
+            match self.ctx.env.git(&path) {
+                None => continue,
+                Some(Ok(g)) => found = Some(g),
+                Some(Err(e)) => self.notices.push(format!(
+                    "{project}: git history unreadable, lanes assumed: {e}"
+                )),
             }
-            if let Some(l) = self.ctx.env.lanes(&path) {
-                self.lanes_cache.insert(path, l);
-                return l;
-            }
+            break;
         }
+        self.gits.insert(project.to_owned(), found.clone());
+        found
+    }
+
+    /// The lanes assumed when no repository can be read: only the last
+    /// configured lane.
+    fn assumed_lanes(&self) -> Lanes {
         let [dev, staging, live] = self.ctx.config.branches().map(|b| !b.is_empty());
         Lanes {
             live,
             staging: staging && !live,
             dev: dev && !staging && !live,
+        }
+    }
+
+    /// Finds a merged card's PR in its project's history: by the PR number in
+    /// the merge message, else by the commit the forge says it landed as.
+    fn find_change(&self, g: &ProjectGit, pr_url: &str) -> Found {
+        let role = |r: &Role| match r {
+            Role::Change(i) => Found::Change(*i),
+            Role::Promotion | Role::BackMerge => Found::Promotion,
+        };
+        // A PR in another repository (an upstream contribution) is not one of
+        // this repository's numbered PRs.
+        let same_repo = g.web.as_ref().is_none_or(|w| {
+            pr_url
+                .to_lowercase()
+                .starts_with(&format!("{}/pull/", w.to_lowercase()))
+        });
+        if same_repo && let Some(r) = pr_number(pr_url).and_then(|n| g.by_pr.get(&n)) {
+            return role(r);
+        }
+        match self
+            .ctx
+            .env
+            .merged_commit(pr_url)
+            .and_then(|sha| g.by_commit.get(&sha))
+        {
+            Some(r) => role(r),
+            None => Found::Missing,
         }
     }
 
@@ -471,6 +685,9 @@ impl<'a> Builder<'a> {
             state,
             tone,
             details,
+            outside: false,
+            in_release: false,
+            change_title: None,
             hold_reason,
             hold_kind,
             order: 0,
@@ -580,14 +797,19 @@ impl<'a> Builder<'a> {
             state,
             tone,
             details,
+            outside: false,
+            in_release: false,
+            change_title: None,
             hold_reason: string_at(r, "hold_reason"),
             hold_kind: string_at(r, "hold_kind"),
             order: 0,
         }
     }
 
-    /// A Dev/Staging/Live card for finished work, or `None` when it finished
-    /// longer ago than the configured window.
+    /// A Dev/Staging/Live card for finished work, or `None` when it is not on
+    /// the board: a change released before the project's latest release, a
+    /// promotion PR (shown through the release headers), or unplaced work
+    /// that finished longer ago than the configured window.
     fn finished_card(
         &mut self,
         rec: &Value,
@@ -602,23 +824,61 @@ impl<'a> Builder<'a> {
             .or_else(|| str_at(rec, "done"))
             .or_else(|| str_at(rec, "reported"));
         let finished = date.and_then(parse_date);
-        if let Some(f) = finished
-            && self.today - f.div_euclid(DAY) > self.ctx.config.finished_days
-        {
-            return None;
-        }
+        let recent = finished
+            .is_none_or(|f| self.today - f.div_euclid(DAY) <= self.ctx.config.finished_days);
         let title = string_at(rec, "title").unwrap_or_else(|| id.clone());
         let project = self.project(str_at(rec, "repo"), &id);
         let pr_url = string_at(rec, "pr_url");
-        let lanes = self.lanes_for(&project, owner_home);
-        let column = if pr_url.is_some() || verb == Some("merged") {
-            landing_column(lanes)
-        } else {
-            final_column(lanes)
-        };
-        let Some(column) = column else {
-            self.laneless.push(project);
-            return None;
+        let merged = pr_url.is_some() || verb == Some("merged");
+        let git = self.git_for(&project, owner_home);
+        let lanes = git
+            .as_ref()
+            .map_or_else(|| self.assumed_lanes(), |g| g.lanes);
+
+        let mut change: Option<Change> = None;
+        let mut unfetched = false;
+        if let (Some(g), Some(url)) = (git.as_deref(), pr_url.as_deref())
+            && g.top().is_some()
+        {
+            match self.find_change(g, url) {
+                Found::Change(i) => {
+                    let c = &g.changes[i];
+                    if !g.visible(c, recent) {
+                        return None;
+                    }
+                    self.claimed.entry(project.clone()).or_default().insert(i);
+                    change = Some(c.clone());
+                }
+                Found::Promotion => return None,
+                Found::Missing => unfetched = true,
+            }
+        }
+        let column = match &change {
+            Some(c) => c.column,
+            None => {
+                if !recent {
+                    return None;
+                }
+                let column = if merged {
+                    landing_column(lanes)
+                } else {
+                    final_column(lanes)
+                };
+                let Some(column) = column else {
+                    self.laneless.push(project);
+                    return None;
+                };
+                // Unmerged finished work in Live stays until the next release.
+                if !merged
+                    && column == Column::Live
+                    && let (Some(f), Some(r)) =
+                        (finished, git.as_ref().and_then(|g| g.release.as_ref()))
+                    && f.div_euclid(DAY) < r.time.div_euclid(DAY)
+                {
+                    return None;
+                }
+                column
+            }
         };
         let mut details = vec![("ID", id.clone())];
         for (label, key) in [
@@ -631,6 +891,20 @@ impl<'a> Builder<'a> {
             if let Some(v) = str_at(rec, key) {
                 details.push((label, v.to_owned()));
             }
+        }
+        if let (Some(c), Some(g)) = (&change, &git) {
+            details.push(("Landed", landed(g, c)));
+            if c.in_release {
+                details.push(("Release", "in the latest Live release".to_owned()));
+            }
+        }
+        if unfetched {
+            self.unfetched.push(id.clone());
+            details.push((
+                "Git",
+                "PR not in the project's history yet (the board reads the clone as of its last fetch)"
+                    .to_owned(),
+            ));
         }
         Some(Card {
             pr_number: pr_url.as_deref().and_then(pr_number),
@@ -646,15 +920,79 @@ impl<'a> Builder<'a> {
             blocked_by: Vec::new(),
             test: None,
             model: None,
-            since: finished,
+            since: change.as_ref().map_or(finished, |c| Some(c.time)),
             since_is_date: true,
             state: verb.unwrap_or("done").to_owned(),
             tone: Tone::Finished,
             details,
+            outside: false,
+            in_release: change.as_ref().is_some_and(|c| c.in_release),
+            change_title: change.map(|c| c.title),
             hold_reason: None,
             hold_kind: None,
             order: 0,
         })
+    }
+
+    /// Plain grey cards for the changes on the board that no Firstmate card
+    /// tracks (hand-opened PRs, direct commits), and each project's release
+    /// state. Only projects already on the board and not halted are read, so
+    /// dormant repositories never add tabs.
+    fn outside_cards(&mut self) {
+        let halted = self.halted_projects();
+        let mut projects: Vec<String> = self.cards.iter().map(|c| c.project.clone()).collect();
+        projects.sort_by_key(|p| p.to_lowercase());
+        projects.dedup();
+        for project in projects {
+            if halted.contains(&project) {
+                continue;
+            }
+            let Some(g) = self.git_for(&project, None) else {
+                continue;
+            };
+            let claimed = self.claimed.get(&project).cloned().unwrap_or_default();
+            for (i, c) in g.changes.iter().enumerate() {
+                let recent = self.today - c.time.div_euclid(DAY) <= self.ctx.config.finished_days;
+                if claimed.contains(&i) || !g.visible(c, recent) {
+                    continue;
+                }
+                let card = outside_card(&project, &g, c);
+                self.push(card);
+            }
+            if g.top().is_some() {
+                self.releases.push(ProjectRelease {
+                    project: project.clone(),
+                    lanes: g.lanes,
+                    refs: g
+                        .refs
+                        .iter()
+                        .map(|r| (r.column, short_ref(&r.refname)))
+                        .collect(),
+                    live: g.release.as_ref().map(|r| LiveRelease {
+                        time: r.time,
+                        pr: r.pr,
+                        pr_url: r.pr.and_then(|n| g.pr_url(n)),
+                        title: r.title.clone(),
+                        version: r.version.clone(),
+                        fast_forward: r.fast_forward,
+                        known: r.known,
+                    }),
+                    migrations: g.migrations.clone(),
+                    fetched: g.fetched,
+                });
+            }
+        }
+    }
+
+    /// Projects halted by a hold reason on one of their Booked or Ready cards.
+    fn halted_projects(&self) -> HashSet<String> {
+        let words = &self.ctx.config.halted_words;
+        self.cards
+            .iter()
+            .filter(|c| matches!(c.column, Column::Booked | Column::Ready))
+            .filter(|c| contains_word(c.hold_reason.as_deref(), words))
+            .map(|c| c.project.clone())
+            .collect()
     }
 
     fn main_home(&mut self) {
@@ -856,14 +1194,14 @@ impl<'a> Builder<'a> {
                 self.laneless.join(", ")
             ));
         }
-        let halted_words = &self.ctx.config.halted_words;
-        let halted: HashSet<String> = self
-            .cards
-            .iter()
-            .filter(|c| matches!(c.column, Column::Booked | Column::Ready))
-            .filter(|c| contains_word(c.hold_reason.as_deref(), halted_words))
-            .map(|c| c.project.clone())
-            .collect();
+        if !self.unfetched.is_empty() {
+            self.notices.push(format!(
+                "{} merged card(s) not found in their project's git history yet, placed by merge date (the board reads each clone as of its last fetch): {}",
+                self.unfetched.len(),
+                self.unfetched.join(", ")
+            ));
+        }
+        let halted = self.halted_projects();
         for c in &mut self.cards {
             if matches!(c.column, Column::Booked | Column::Ready)
                 && (halted.contains(&c.project) || c.hold_kind.as_deref() == Some("parked"))
@@ -883,9 +1221,11 @@ impl<'a> Builder<'a> {
                     .then(a.paused.cmp(&b.paused))
                     .then(a.order.cmp(&b.order)),
                 Column::Building => a.order.cmp(&b.order),
-                Column::Dev | Column::Staging | Column::Live => {
-                    b.since.cmp(&a.since).then(a.order.cmp(&b.order))
-                }
+                Column::Dev | Column::Staging | Column::Live => b
+                    .in_release
+                    .cmp(&a.in_release)
+                    .then(b.since.cmp(&a.since))
+                    .then(a.order.cmp(&b.order)),
             })
         });
         let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -910,6 +1250,7 @@ impl<'a> Builder<'a> {
             generated: string_at(self.snap, "generated"),
             home: string_at(self.snap, "fm_home"),
             notices: self.notices,
+            releases: self.releases,
         }
     }
 }

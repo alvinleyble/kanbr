@@ -9,7 +9,7 @@ id = "kanbr"
 name = "Kanbr"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
-description = "Kanban board for Firstmate work: Booked, Ready, Building, Dev, Staging, Live, with project tabs and a waiting-on-you strip. Read-only."
+description = "Kanban board for Firstmate work: Booked, Ready, Building, then Dev, Staging, Live from git, with release headers and notes, project tabs, and a waiting-on-you strip. Read-only."
 platforms = ["linux", "macos"]
 
 [[build]]

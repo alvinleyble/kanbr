@@ -39,8 +39,9 @@ lines up:
 In this release Dev, Staging, and Live show only just-finished work. Tracking each
 change as it is promoted from branch to branch comes in a later release.
 
-**Waiting on you.** A decision waiting on you gets a red `⚑` badge. The card stays
-in its real column. The red strip at the top counts them; press `w`, or click the
+**Waiting on you.** A decision waiting on you, whether a held backlog item or a
+worker (yours or a second mate's) that stopped to ask, gets a red `⚑` badge. The
+card stays in its real column. The red strip at the top counts them; press `w`, or click the
 strip, to jump from one to the next.
 
 **Cards.** Each card has three lines:
@@ -251,7 +252,8 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-CI runs build, clippy, and tests on Linux and macOS for every pull request.
+CI runs the format check, build, clippy, tests, and the install script on Linux
+and macOS for every pull request.
 
 To publish prebuilt binaries, bump `version` in both `Cargo.toml` and
 `herdr-plugin.toml` (a test keeps them equal), merge, then push the tag

@@ -324,6 +324,11 @@ pub fn project_check(name: &str, pg: &ProjectGit, config: &Config, now: i64, sho
         if let Some(v) = &r.version {
             let _ = write!(detail, " v{v}");
         }
+        if !r.known {
+            detail.push_str(
+                " (a fast-forward whose start is unknown: gh found no promotion PR and the ref has no reflog)",
+            );
+        }
     }
     if !pg.migrations.is_empty() {
         let _ = write!(
@@ -337,7 +342,11 @@ pub fn project_check(name: &str, pg: &ProjectGit, config: &Config, now: i64, sho
             .refs
             .iter()
             .any(|r| r.refname.starts_with("refs/remotes/"));
-    let mut level = Level::Ok;
+    let mut level = if pg.release.as_ref().is_some_and(|r| !r.known) {
+        Level::Warn
+    } else {
+        Level::Ok
+    };
     match pg.fetched {
         Some(f) => {
             let _ = write!(detail, "; fetched {}", format_ago(f, now));
@@ -531,13 +540,15 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
         Ok(s) => check(
             Level::Ok,
             "gh",
-            format!("{s}; asked only about a merged PR whose merge message has no PR number"),
+            format!(
+                "{s}; asked only about a merged PR whose merge message has no PR number, and the promotion PR behind a fast-forward release"
+            ),
         ),
         Err(e) => check(
             Level::Warn,
             "gh",
             format!(
-                "{}: a merged PR whose merge message has no PR number (a rebase merge or an edited message) is placed by its merge date",
+                "{}: a merged PR whose merge message has no PR number (a rebase merge or an edited message) is placed by its merge date, and a fast-forward release starts where the reflog last saw the Live branch",
                 match e {
                     GhError::Missing => "not installed".to_owned(),
                     GhError::Failed(why) => format!("not usable ({why})"),

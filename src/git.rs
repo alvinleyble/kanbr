@@ -131,6 +131,14 @@ impl Git {
             .collect())
     }
 
+    /// The commits `refname` pointed at, newest first, from its reflog
+    /// (empty when it has none).
+    pub fn reflog(&self, refname: &str) -> Vec<String> {
+        self.run(&["log", "-g", "--format=%H", "--max-count=100", refname, "--"])
+            .map(|out| out.lines().map(|l| l.trim().to_owned()).collect())
+            .unwrap_or_default()
+    }
+
     /// Up to `max` first-parent commits from `rev`, newest first.
     pub fn first_parent_log(&self, rev: &str, max: usize) -> Result<Vec<Commit>, String> {
         let out = self.run(&[

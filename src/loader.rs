@@ -104,7 +104,20 @@ impl Env for Loader {
         }
         let mut memos = self.memos.borrow_mut();
         let memo = memos.entry(repo.to_path_buf()).or_default();
-        let result = analyze_refs(&git, &refs, branches, memo).map(Arc::new);
+        let promotions = |web: &str, branch: &str, tip: &str| {
+            if self.gh_missing.get() {
+                return None;
+            }
+            match forge::promotion(web, branch, tip) {
+                Ok(p) => p,
+                Err(GhError::Missing) => {
+                    self.gh_missing.set(true);
+                    None
+                }
+                Err(GhError::Failed(_)) => None,
+            }
+        };
+        let result = analyze_refs(&git, &refs, branches, memo, &promotions).map(Arc::new);
         if let Ok(pg) = &result {
             self.gits
                 .borrow_mut()

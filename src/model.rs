@@ -190,6 +190,10 @@ pub struct LiveRelease {
     pub title: String,
     /// The app version on the Live branch, where the project has one.
     pub version: Option<String>,
+    /// The Live branch was fast-forwarded to a lower lane's commit.
+    pub fast_forward: bool,
+    /// Where the release starts is known, so its changes are.
+    pub known: bool,
 }
 
 /// Release state for a project on the board.
@@ -970,6 +974,8 @@ impl<'a> Builder<'a> {
                         pr_url: r.pr.and_then(|n| g.pr_url(n)),
                         title: r.title.clone(),
                         version: r.version.clone(),
+                        fast_forward: r.fast_forward,
+                        known: r.known,
                     }),
                     migrations: g.migrations.clone(),
                     fetched: g.fetched,

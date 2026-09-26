@@ -21,7 +21,10 @@
 //! The latest Live release is the newest landing on the Live branch (a
 //! promotion, a merged PR, or a direct commit; a rebase that landed several
 //! commits at once counts as one). Its changes are those present on Live now
-//! but not just before it.
+//! but not just before it. A fast-forward leaves no landing of its own, so
+//! the Live branch's tip before it comes from the merged promotion PR (through
+//! `gh`), else from the Live ref's reflog; with neither, the release's start
+//! is unknown and no change is marked as part of it.
 //!
 //! Everything here is read-only git; results that cannot change for the same
 //! commits are memoised across refreshes in [`Memo`].
@@ -83,7 +86,15 @@ pub struct Release {
     pub title: String,
     /// The app version on the Live branch, where the project has one.
     pub version: Option<String>,
+    /// The Live branch was fast-forwarded to a lower lane's commit.
+    pub fast_forward: bool,
+    /// Where the release starts is known, so its changes are.
+    pub known: bool,
 }
+
+/// Finds the merged PR into `branch` of the GitHub repository `web` that
+/// landed as commit `tip`: its number and the branch's commit before it.
+pub type Promotions<'a> = &'a dyn Fn(&str, &str, &str) -> Option<(u64, String)>;
 
 /// What a scanned landing commit or PR number turned out to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +191,7 @@ struct Evidence {
 /// Analyses a repository for the `[dev, staging, live]` branch names.
 #[cfg(test)]
 pub fn analyze(git: &Git, branches: [&str; 3], memo: &mut Memo) -> Result<ProjectGit, String> {
-    analyze_refs(git, &git.branches()?, branches, memo)
+    analyze_refs(git, &git.branches()?, branches, memo, &|_, _, _| None)
 }
 
 /// The tips of the branches backing `[dev, staging, live]`, as read from
@@ -198,6 +209,7 @@ pub fn analyze_refs(
     refs: &[(String, String)],
     branches: [&str; 3],
     memo: &mut Memo,
+    promotions: Promotions,
 ) -> Result<ProjectGit, String> {
     let columns = [Column::Dev, Column::Staging, Column::Live];
     let mut lanes: Vec<Lane> = Vec::new();
@@ -265,6 +277,7 @@ pub fn analyze_refs(
         lanes,
         kinds: HashMap::new(),
         pids: None,
+        promotions,
     };
     a.run(&mut pg)?;
     Ok(pg)
@@ -278,6 +291,7 @@ struct Analysis<'a> {
     /// Patch id of each rebased copy and of the lower-lane commits, loaded
     /// only when a copy exists.
     pids: Option<HashMap<String, Vec<String>>>,
+    promotions: Promotions<'a>,
 }
 
 /// How many landings at the head of `log` arrived together, and the position
@@ -303,7 +317,33 @@ impl Analysis<'_> {
         let n = self.lanes.len();
         let top = n - 1;
         let live = self.lanes[top].column == Column::Live;
-        let (_, prev) = release_group(&self.lanes[top].log);
+        let (_, mut prev) = release_group(&self.lanes[top].log);
+        let l = self.lanes[top].log[0].clone();
+        let fast_forward = live
+            && self.lanes[..top]
+                .iter()
+                .any(|lane| lane.index.contains_key(&l.sha));
+        let mut promotion = None;
+        let mut known = true;
+        if fast_forward && self.lanes[top].log.len() > 1 {
+            promotion = pg
+                .web
+                .as_deref()
+                .and_then(|w| (self.promotions)(w, &self.lanes[top].branch, &l.sha));
+            let lane = &self.lanes[top];
+            let earlier = |sha: &str| lane.index.get(sha).copied().filter(|p| *p > 0);
+            prev = promotion
+                .as_ref()
+                .and_then(|(_, base)| earlier(base))
+                .or_else(|| {
+                    self.git
+                        .reflog(&lane.r.refname)
+                        .iter()
+                        .find(|s| **s != l.sha)
+                        .and_then(|s| earlier(s))
+                });
+            known = prev.is_some();
+        }
         // What each lane holds now; the lowest lane is never a target.
         let mut tips = vec![Evidence {
             reach: HashSet::new(),
@@ -329,6 +369,7 @@ impl Analysis<'_> {
                             }
                         }
                         let in_release = live
+                            && known
                             && reached == top
                             && match &before {
                                 Some(b) => !self.present(&c, b)?,
@@ -363,7 +404,6 @@ impl Analysis<'_> {
         }
 
         if live {
-            let l = self.lanes[top].log[0].clone();
             let version = match self.memo.versions.get(&l.sha) {
                 Some(v) => v.clone(),
                 None => {
@@ -372,13 +412,23 @@ impl Analysis<'_> {
                     v
                 }
             };
-            let pr = pr_of(&l);
+            let (pr, title) = if fast_forward {
+                (promotion.map(|p| p.0), l.subject.clone())
+            } else {
+                let pr = pr_of(&l);
+                (
+                    pr.as_ref().map(|p| p.0),
+                    pr.map_or(l.subject.clone(), |p| p.1),
+                )
+            };
             pg.release = Some(Release {
                 commit: l.sha.clone(),
                 time: l.time,
-                pr: pr.as_ref().map(|p| p.0),
-                title: pr.map_or(l.subject.clone(), |p| p.1),
+                pr,
+                title,
                 version,
+                fast_forward,
+                known,
             });
         }
 

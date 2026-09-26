@@ -59,7 +59,12 @@ anywhere, including directly on GitHub, moves its cards on the next refresh.
 - **Live is the latest release.** A release is the newest landing on the Live branch:
   a promotion, a merged PR, or a direct commit (a rebase merge that lands several
   commits at once counts as one). Live shows only the changes that release brought,
-  and clears when the next one lands.
+  and clears when the next one lands. A fast-forward promotion (such as
+  `git push origin staging:main`) leaves no commit of its own, so the release starts
+  at the Live branch's commit before it: the base of the merged promotion PR, asked
+  of `gh`, else the previous entry in the Live ref's reflog (with several releases
+  between two fetches, the reflog sees them as one). With neither, the Live header
+  says `release boundary unknown` and no change is claimed for the release.
 - **Changes made outside Firstmate.** A merged PR or direct commit with no Firstmate
   card (a hand-opened PR, a manual commit) still shows, as a plain grey card titled
   from the PR or commit, so release headers and notes stay complete. Promotion PRs
@@ -89,8 +94,8 @@ the promotion PR link, each database migration, and the branches read.
 **Release notes.** Press `R` for short plain-language notes for the Live release,
 ready to send to users: the changes grouped under New, Improved, and Fixed, with
 conventional-commit prefixes such as `feat(orders):` dropped, and internal changes
-(docs, tests, CI, chores) summed up in one line. Press `c` to copy them, or select
-them with the mouse. `kanbr notes` prints the same text.
+(docs, tests, CI, chores, and changes known only by a merge message) summed up in
+one line. Press `c` to copy them, or select them with the mouse. `kanbr notes` prints the same text.
 
 **Waiting on you.** A decision waiting on you, whether a held backlog item or a
 worker (yours or a second mate's) that stopped to ask, gets a red `⚑` badge. The
@@ -278,7 +283,8 @@ It checks:
   fetched (a clone of a project on the board that has not fetched for a week is a
   warning, since the board lags the forge until it does);
 - `gh` is installed and signed in (optional: it is only asked about a merged PR whose
-  merge message has no PR number);
+  merge message has no PR number, and about the promotion PR behind a fast-forward
+  release). A fast-forward release whose start is unknown is a warning;
 - the snapshot actually produces cards (open backlog rows with no cards means the
   data shape changed).
 
@@ -287,7 +293,7 @@ It checks:
   ok    backlog rows      26 structured rows carry every field Kanbr reads
   ok    project git       firstmate: origin/main; latest release 25 Sep #9; fetched 18h ago
   ok    project git       Leyble-Hub: origin/dev origin/staging origin/main; latest release 10 Sep #122 v1.2.1; 2 database change(s) waiting in staging; fetched 38m ago
-  ok    gh                installed and signed in; asked only about a merged PR whose merge message has no PR number
+  ok    gh                installed and signed in; asked only about a merged PR whose merge message has no PR number, and the promotion PR behind a fast-forward release
   ok    board             36 cards (Booked 12 · Ready 2 · Building 2 · Dev 0 · Staging 12 · Live 8), 6 waiting on you, 7 tabs
 ```
 
@@ -298,8 +304,9 @@ It checks:
 | `bin/fm-fleet-snapshot.sh --json` | Firstmate's canonical fleet snapshot: backlog, workers, and every registered second mate. This is the complete contract that `fm-bearings-snapshot.sh` summarizes; Kanbr needs fields the summary leaves out, such as each item's project and hold kind. |
 | `state/<id>.meta` | a worker's model and effort, which no snapshot carries |
 | `data/projects.md` | registered project names |
-| each project's git history | which configured branches back Dev, Staging, and Live; how far each merged change has reached; the latest release, app version, and database migrations. Read-only: `for-each-ref`, `log`, `rev-list`, `merge-base`, `diff-tree`, `cherry`, `patch-id`, `ls-tree`, `cat-file`, and the modification time of `FETCH_HEAD` |
+| each project's git history | which configured branches back Dev, Staging, and Live; how far each merged change has reached; the latest release, app version, and database migrations. Read-only: `for-each-ref`, `log`, `rev-list`, `merge-base`, `diff-tree`, `cherry`, `patch-id`, `ls-tree`, `cat-file`, the Live ref's reflog (`log -g`, only after a fast-forward release), and the modification time of `FETCH_HEAD` |
 | `gh pr view` (optional) | the commit a merged PR landed as, only for a Firstmate card whose PR number is in no merge message |
+| `gh pr list` (optional) | the merged promotion PR behind a fast-forward to the Live branch, and the branch's commit before it: where that release starts |
 
 Kanbr runs the snapshot with `FM_HOME` set to your home. It never writes any
 Firstmate file or project repository, and never fetches. The snapshot may refresh

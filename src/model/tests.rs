@@ -150,6 +150,8 @@ pub(crate) fn shop_git() -> ProjectGit {
         pr: Some(150),
         title: "Promote staging to main".into(),
         version: Some("1.2.1".into()),
+        fast_forward: false,
+        known: true,
     });
     g.migrations = vec!["supabase/migrations/20260926_fee.sql".into()];
     g.fetched = Some(parse_date("2026-09-26T09:00:00Z").unwrap());

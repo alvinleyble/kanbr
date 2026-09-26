@@ -471,6 +471,73 @@ fn a_rebase_merge_that_lands_several_commits_is_one_release() {
 }
 
 #[test]
+fn a_fast_forward_release_holds_everything_since_the_previous_live_tip() {
+    let r = three_lanes("fastforward");
+    let ff_main = || {
+        r.checkout("main");
+        r.git(&["merge", "-q", "--ff-only", "staging"]);
+    };
+    r.merge_pr("dev", 5, "Earlier work", &["e"]);
+    r.merge_promote("dev", "staging", 9);
+    ff_main();
+    let previous = r.sha("main");
+    r.merge_pr("dev", 1, "One", &["one"]);
+    r.merge_pr("dev", 2, "Two", &["two"]);
+    r.merge_promote("dev", "staging", 10);
+    r.merge_pr("dev", 3, "Three", &["three"]);
+    r.merge_promote("dev", "staging", 11);
+    ff_main();
+
+    let released = |pg: &ProjectGit| {
+        [1, 2, 3, 5]
+            .map(|pr| (change(pg, pr).column, change(pg, pr).in_release))
+            .to_vec()
+    };
+    let expected = vec![
+        (Column::Live, true),
+        (Column::Live, true),
+        (Column::Live, true),
+        (Column::Live, false),
+    ];
+
+    // Without gh, the Live ref's reflog gives the tip before the release.
+    let pg = r.analyze();
+    assert_eq!(released(&pg), expected);
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!(
+        (rel.pr, rel.fast_forward, rel.known),
+        (None, true, true),
+        "#11 is a staging PR, not the release"
+    );
+
+    // The merged promotion PR, when gh finds it, names the release and its base.
+    let git = Git::new(&r.dir);
+    let tip = r.sha("main");
+    let lookup = |web: &str, branch: &str, t: &str| {
+        (web == "https://github.com/acme/shop" && branch == "main" && t == tip)
+            .then(|| (12, previous.clone()))
+    };
+    r.git(&["remote", "add", "origin", "git@github.com:acme/shop.git"]);
+    let pg = analyze_refs(
+        &git,
+        &git.branches().unwrap(),
+        ["dev", "staging", "main"],
+        &mut Memo::default(),
+        &lookup,
+    )
+    .unwrap();
+    assert_eq!(released(&pg), expected);
+    assert_eq!(pg.release.as_ref().unwrap().pr, Some(12));
+
+    // With neither, the boundary is unknown and nothing is claimed released.
+    fs::remove_file(r.dir.join(".git/logs/refs/heads/main")).unwrap();
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!((rel.fast_forward, rel.known), (true, false));
+    assert!(pg.changes.iter().all(|c| !c.in_release));
+}
+
+#[test]
 fn a_project_without_staging_goes_from_dev_to_live() {
     let r = Repo::new("devlive");
     r.branch_from("dev", "main");

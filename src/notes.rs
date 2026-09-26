@@ -38,11 +38,24 @@ pub fn column_header(board: &Board, column: Column, project: Option<&str>) -> Ve
                 return Vec::new();
             }
             let releases = plural(releases, "release", "releases");
+            let summary = format!(
+                "{} in {releases}",
+                plural(board.release_cards(None).len(), "change", "changes")
+            );
+            let unknown = board
+                .releases
+                .iter()
+                .filter(|r| r.live.as_ref().is_some_and(|l| !l.known))
+                .count();
+            if unknown == 0 {
+                return vec![summary, releases];
+            }
             vec![
                 format!(
-                    "{} in {releases}",
-                    plural(board.release_cards(None).len(), "change", "changes")
+                    "{summary} · {} unknown",
+                    plural(unknown, "boundary", "boundaries")
                 ),
+                summary,
                 releases,
             ]
         }
@@ -70,15 +83,20 @@ fn live_line(board: &Board, rel: &ProjectRelease, long: bool) -> String {
     if let Some(v) = &live.version {
         parts.push(format!("v{}", v.trim_start_matches('v')));
     }
-    parts.push(plural(
-        board.release_cards(Some(&rel.project)).len(),
-        "change",
-        "changes",
-    ));
+    parts.push(if live.known {
+        plural(
+            board.release_cards(Some(&rel.project)).len(),
+            "change",
+            "changes",
+        )
+    } else {
+        "release boundary unknown".to_owned()
+    });
     parts.join(" · ")
 }
 
-/// The Live header, then `10 Sep #116 v1.2.1` and `10 Sep #116`.
+/// The Live header, then `10 Sep #116 v1.2.1` and `10 Sep #116` (each
+/// ending in `?` when the release boundary is unknown).
 fn live_forms(board: &Board, rel: &ProjectRelease) -> Vec<String> {
     let full = live_line(board, rel, false);
     let Some(live) = &rel.live else {
@@ -92,7 +110,13 @@ fn live_forms(board: &Board, rel: &ProjectRelease) -> Vec<String> {
             .as_deref()
             .map(|v| format!("v{}", v.trim_start_matches('v'))),
     );
-    vec![full, key.join(" "), short]
+    let mut forms = vec![full, key.join(" "), short];
+    if !live.known {
+        for f in &mut forms[1..] {
+            f.push_str(" ?");
+        }
+    }
+    forms
 }
 
 /// `4 to promote · 2 db changes`, then shorter forms.
@@ -132,6 +156,9 @@ pub fn details(board: &Board, project: Option<&str>, now: i64) -> Vec<Details> {
                     rows.push(match (&live.pr_url, live.pr) {
                         (Some(url), _) => ("Promotion PR", url.clone()),
                         (None, Some(n)) => ("Promotion PR", format!("#{n}")),
+                        (None, None) if live.fast_forward => {
+                            ("Landed as", format!("fast-forward to {}", live.title))
+                        }
                         (None, None) => ("Landed as", format!("direct commit: {}", live.title)),
                     });
                 }
@@ -183,15 +210,30 @@ enum Group {
     Internal,
 }
 
+/// Whether `text` is a git or GitHub merge message rather than a title.
+fn raw_merge(text: &str) -> bool {
+    [
+        "Merge pull request #",
+        "Merge branch ",
+        "Merge remote-tracking branch ",
+    ]
+    .iter()
+    .any(|p| text.starts_with(p))
+}
+
 /// A release-note line for a card: the conventional-commit type and scope
-/// dropped, first letter capitalised, with the group it belongs to.
+/// dropped, first letter capitalised, with the group it belongs to. A change
+/// known only by a merge message is summed up with the internal changes.
 fn note(card: &Card) -> (Group, String, Option<String>) {
     let text = card
         .change_title
         .as_deref()
-        .filter(|t| !t.starts_with("Merge "))
+        .filter(|t| !raw_merge(t))
         .unwrap_or(&card.title)
         .trim();
+    if raw_merge(text) {
+        return (Group::Internal, String::new(), Some("merge".to_owned()));
+    }
     let (kind, rest) = match text.split_once(':') {
         Some((head, rest))
             if !head.contains(' ')
@@ -239,7 +281,7 @@ pub fn release_notes(board: &Board, project: Option<&str>) -> String {
     for rel in board.releases_in(project) {
         let Some(live) = &rel.live else { continue };
         let cards = board.release_cards(Some(&rel.project));
-        if cards.is_empty() {
+        if live.known && cards.is_empty() {
             continue;
         }
         if !out.is_empty() {
@@ -256,6 +298,13 @@ pub fn release_notes(board: &Board, project: Option<&str>) -> String {
             rel.project,
             format_long_day(live.time)
         );
+        if !live.known {
+            let _ = writeln!(
+                out,
+                "\nRelease boundary unknown: the changes it brought cannot be listed."
+            );
+            continue;
+        }
         let mut notes: Vec<(Group, String, Option<String>)> =
             cards.iter().map(|c| note(c)).collect();
         notes.sort_by_key(|(g, _, _)| *g);
@@ -333,6 +382,72 @@ mod tests {
         assert!(
             !text.contains("Old release"),
             "earlier releases are not in the notes\n{text}"
+        );
+    }
+
+    #[test]
+    fn merge_messages_are_summed_up_not_listed() {
+        let mut b = release_board();
+        for (n, msg) in [
+            (142, "Merge pull request #142 from o/receipts"),
+            (143, "Merge branch 'hotfix' into main"),
+        ] {
+            let c = b
+                .cards
+                .iter_mut()
+                .find(|c| c.project == "Shop" && c.pr_number == Some(n))
+                .unwrap();
+            c.title = msg.to_owned();
+            c.change_title = Some(msg.to_owned());
+        }
+        let text = release_notes(&b, Some("Shop"));
+        assert!(!text.contains("Merge "), "{text}");
+        assert!(
+            text.contains("Behind the scenes: 2 changes (merge)."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_release_boundary_is_stated() {
+        let mut b = release_board();
+        let rel = b.releases.iter_mut().find(|r| r.project == "Shop").unwrap();
+        let live = rel.live.as_mut().unwrap();
+        live.known = false;
+        live.fast_forward = true;
+        live.pr = None;
+        live.pr_url = None;
+        for c in b.cards.iter_mut() {
+            c.in_release = false;
+        }
+        assert_eq!(
+            column_header(&b, Column::Live, Some("Shop")),
+            vec![
+                "25 Sep · v1.2.1 · release boundary unknown",
+                "25 Sep v1.2.1 ?",
+                "25 Sep ?"
+            ]
+        );
+        assert_eq!(
+            column_header(&b, Column::Live, None),
+            vec![
+                "0 changes in 1 release · 1 boundary unknown",
+                "0 changes in 1 release",
+                "1 release"
+            ]
+        );
+        let text = release_notes(&b, Some("Shop"));
+        assert!(
+            text.contains("Release boundary unknown: the changes it brought cannot be listed."),
+            "{text}"
+        );
+        let d = details(&b, Some("Shop"), now());
+        assert!(
+            d[0].rows
+                .iter()
+                .any(|(l, v)| *l == "Landed as" && v.starts_with("fast-forward to ")),
+            "{:?}",
+            d[0].rows
         );
     }
 

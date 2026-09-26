@@ -538,6 +538,29 @@ fn a_fast_forward_release_holds_everything_since_the_previous_live_tip() {
 }
 
 #[test]
+fn a_merge_release_fast_forwarded_back_to_dev_keeps_its_pr() {
+    let r = Repo::new("syncback");
+    r.branch_from("dev", "main");
+    r.merge_pr("dev", 1, "One", &["one"]);
+    r.merge_promote("dev", "main", 12);
+    r.merge_pr("dev", 2, "Two", &["two"]);
+    r.merge_promote("dev", "main", 13);
+    r.checkout("dev");
+    r.git(&["merge", "-q", "--ff-only", "main"]);
+
+    let check = |pg: &ProjectGit| {
+        let rel = pg.release.as_ref().unwrap();
+        assert_eq!(
+            (rel.pr, rel.fast_forward, rel.known),
+            (Some(13), false, true)
+        );
+    };
+    check(&r.analyze());
+    fs::remove_file(r.dir.join(".git/logs/refs/heads/main")).unwrap();
+    check(&r.analyze());
+}
+
+#[test]
 fn a_project_without_staging_goes_from_dev_to_live() {
     let r = Repo::new("devlive");
     r.branch_from("dev", "main");

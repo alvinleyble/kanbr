@@ -317,22 +317,33 @@ impl Analysis<'_> {
         let n = self.lanes.len();
         let top = n - 1;
         let live = self.lanes[top].column == Column::Live;
-        let (_, mut prev) = release_group(&self.lanes[top].log);
+        let (_, landing) = release_group(&self.lanes[top].log);
         let l = self.lanes[top].log[0].clone();
-        let fast_forward = live
-            && self.lanes[..top]
+        // A merged PR from a lower lane that now holds the tip landed on the
+        // Live branch and was fast-forwarded back down.
+        let merged_from = pr_of(&l).and_then(|p| p.2);
+        let lower: Vec<&Lane> = self.lanes[..top]
+            .iter()
+            .filter(|lane| lane.index.contains_key(&l.sha))
+            .collect();
+        let candidate = live
+            && landing.is_some()
+            && !lower.is_empty()
+            && !lower
                 .iter()
-                .any(|lane| lane.index.contains_key(&l.sha));
+                .any(|lane| merged_from.as_deref() == Some(lane.branch.as_str()));
+        let mut prev = landing;
         let mut promotion = None;
         let mut known = true;
-        if fast_forward && self.lanes[top].log.len() > 1 {
+        let mut fast_forward = false;
+        if candidate {
             promotion = pg
                 .web
                 .as_deref()
                 .and_then(|w| (self.promotions)(w, &self.lanes[top].branch, &l.sha));
             let lane = &self.lanes[top];
             let earlier = |sha: &str| lane.index.get(sha).copied().filter(|p| *p > 0);
-            prev = promotion
+            let boundary = promotion
                 .as_ref()
                 .and_then(|(_, base)| earlier(base))
                 .or_else(|| {
@@ -342,7 +353,11 @@ impl Analysis<'_> {
                         .find(|s| **s != l.sha)
                         .and_then(|s| earlier(s))
                 });
-            known = prev.is_some();
+            if boundary != landing {
+                fast_forward = true;
+                known = boundary.is_some();
+                prev = boundary;
+            }
         }
         // What each lane holds now; the lowest lane is never a target.
         let mut tips = vec![Evidence {

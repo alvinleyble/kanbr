@@ -24,6 +24,9 @@ const FORGE_TTL: Duration = Duration::from_secs(600);
 /// Meta files by path, with the modification time they were read at.
 type MetaCache = HashMap<PathBuf, (Option<SystemTime>, Option<Meta>)>;
 
+/// Promotion PRs by (repository, Live branch, tip), with when they were asked.
+type PromotionCache = HashMap<(String, String, String), (Instant, Option<(u64, String)>)>;
+
 /// What a release analysis was computed from: the lane tips and the last fetch.
 type GitKey = (Vec<Option<String>>, Option<i64>);
 
@@ -34,6 +37,7 @@ pub struct Loader {
     gits: RefCell<HashMap<PathBuf, (GitKey, Arc<ProjectGit>)>>,
     memos: RefCell<HashMap<PathBuf, Memo>>,
     forge: RefCell<HashMap<String, (Instant, Option<String>)>>,
+    promotions: RefCell<PromotionCache>,
     gh_missing: Cell<bool>,
 }
 
@@ -46,6 +50,7 @@ impl Loader {
             gits: RefCell::new(HashMap::new()),
             memos: RefCell::new(HashMap::new()),
             forge: RefCell::new(HashMap::new()),
+            promotions: RefCell::new(HashMap::new()),
             gh_missing: Cell::new(false),
         }
     }
@@ -108,14 +113,24 @@ impl Env for Loader {
             if self.gh_missing.get() {
                 return None;
             }
-            match forge::promotion(web, branch, tip) {
+            let key = (web.to_owned(), branch.to_owned(), tip.to_owned());
+            if let Some((at, p)) = self.promotions.borrow().get(&key)
+                && (p.is_some() || at.elapsed() < FORGE_TTL)
+            {
+                return p.clone();
+            }
+            let p = match forge::promotion(web, branch, tip) {
                 Ok(p) => p,
                 Err(GhError::Missing) => {
                     self.gh_missing.set(true);
-                    None
+                    return None;
                 }
                 Err(GhError::Failed(_)) => None,
-            }
+            };
+            self.promotions
+                .borrow_mut()
+                .insert(key, (Instant::now(), p.clone()));
+            p
         };
         let result = analyze_refs(&git, &refs, branches, memo, &promotions).map(Arc::new);
         if let Ok(pg) = &result {

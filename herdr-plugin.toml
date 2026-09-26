@@ -1,0 +1,22 @@
+# Kanbr: a Kanban board for Firstmate work inside Herdr.
+#
+#   herdr plugin install alvinleyble/kanbr
+#
+# The build step puts the `kanbr` binary at target/release/kanbr: it downloads
+# the prebuilt binary for this version and platform from the GitHub release
+# (checksum-verified), or builds from source with cargo when none matches.
+id = "kanbr"
+name = "Kanbr"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Kanban board for Firstmate work: Booked, Ready, Building, Dev, Staging, Live, with project tabs and a waiting-on-you strip. Read-only."
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/install.sh"]
+
+[[actions]]
+id = "open"
+title = "Open Kanbr board"
+description = "Open the Firstmate Kanban board in its own Kanbr workspace, or focus it when it is already open."
+command = ["./target/release/kanbr", "open"]

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: build, clippy, test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Build
+        run: cargo build --locked
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Install script
+        run: |
+          sh -n scripts/install.sh
+          KANBR_BUILD_FROM_SOURCE=1 sh scripts/install.sh
+          ./target/release/kanbr --version

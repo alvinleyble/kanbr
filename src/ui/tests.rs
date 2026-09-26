@@ -249,6 +249,12 @@ fn release_headers_sit_under_staging_and_live() {
         "{screen}"
     );
     assert!(screen.contains("1 to promote · 1 db change"), "{screen}");
+    let narrow = draw(&mut a, 120, 40);
+    assert!(
+        narrow.contains(" 25 Sep #150 v1.2.1"),
+        "shorter form\n{narrow}"
+    );
+    assert!(narrow.contains(" 1 ready · 1 db"), "{narrow}");
     let site = tab_index(&a, "Site");
     a.select_tab(site);
     let screen = draw(&mut a, 252, 40);

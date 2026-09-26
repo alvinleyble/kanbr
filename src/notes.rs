@@ -11,44 +11,46 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// The compact header line under a release column's title, for one project
-/// or the whole board. `None` where there is nothing to say.
-pub fn column_header(board: &Board, column: Column, project: Option<&str>) -> Option<String> {
+/// The header line under a release column's title, for one project or the
+/// whole board: the full wording first, then shorter forms for narrow
+/// columns. Empty where there is nothing to say.
+pub fn column_header(board: &Board, column: Column, project: Option<&str>) -> Vec<String> {
     if let Some(p) = project {
-        let rel = board.release(p)?;
+        let Some(rel) = board.release(p) else {
+            return Vec::new();
+        };
         if !rel.uses(column) {
-            return Some("not used".to_owned());
+            return vec!["not used".to_owned()];
         }
         return match column {
-            Column::Live => Some(live_line(board, rel, false)),
-            Column::Staging => Some(staging_line(
+            Column::Live => live_forms(board, rel),
+            Column::Staging => staging_forms(
                 board.column_cards(Column::Staging, Some(p)).len(),
                 rel.migrations.len(),
-            )),
-            _ => None,
+            ),
+            _ => Vec::new(),
         };
     }
     match column {
         Column::Live => {
             let releases = board.releases.iter().filter(|r| r.live.is_some()).count();
-            (releases > 0).then(|| {
+            if releases == 0 {
+                return Vec::new();
+            }
+            let releases = plural(releases, "release", "releases");
+            vec![
                 format!(
-                    "{} in {}",
-                    plural(board.release_cards(None).len(), "change", "changes"),
-                    plural(releases, "release", "releases")
-                )
-            })
+                    "{} in {releases}",
+                    plural(board.release_cards(None).len(), "change", "changes")
+                ),
+                releases,
+            ]
         }
-        Column::Staging => {
-            let staged = board.releases.iter().any(|r| r.lanes.staging);
-            staged.then(|| {
-                staging_line(
-                    board.column_cards(Column::Staging, None).len(),
-                    board.releases.iter().map(|r| r.migrations.len()).sum(),
-                )
-            })
-        }
-        _ => None,
+        Column::Staging if board.releases.iter().any(|r| r.lanes.staging) => staging_forms(
+            board.column_cards(Column::Staging, None).len(),
+            board.releases.iter().map(|r| r.migrations.len()).sum(),
+        ),
+        _ => Vec::new(),
     }
 }
 
@@ -76,17 +78,39 @@ fn live_line(board: &Board, rel: &ProjectRelease, long: bool) -> String {
     parts.join(" · ")
 }
 
-/// `4 to promote · 2 db changes`.
-fn staging_line(ready: usize, migrations: usize) -> String {
-    let mut s = if ready == 0 {
+/// The Live header, then `10 Sep #116 v1.2.1` and `10 Sep #116`.
+fn live_forms(board: &Board, rel: &ProjectRelease) -> Vec<String> {
+    let full = live_line(board, rel, false);
+    let Some(live) = &rel.live else {
+        return vec![full];
+    };
+    let mut key = vec![format_day(live.time)];
+    key.extend(live.pr.map(|n| format!("#{n}")));
+    let short = key.join(" ");
+    key.extend(
+        live.version
+            .as_deref()
+            .map(|v| format!("v{}", v.trim_start_matches('v'))),
+    );
+    vec![full, key.join(" "), short]
+}
+
+/// `4 to promote · 2 db changes`, then shorter forms.
+fn staging_forms(ready: usize, migrations: usize) -> Vec<String> {
+    let mut full = if ready == 0 {
         "nothing to promote".to_owned()
     } else {
         format!("{ready} to promote")
     };
-    if migrations > 0 {
-        let _ = write!(s, " · {}", plural(migrations, "db change", "db changes"));
+    if migrations == 0 {
+        return vec![full, format!("{ready} ready")];
     }
-    s
+    let _ = write!(full, " · {}", plural(migrations, "db change", "db changes"));
+    vec![
+        full,
+        format!("{ready} ready · {migrations} db"),
+        format!("{ready} · {migrations} db"),
+    ]
 }
 
 /// One project's release details: label/value rows.
@@ -325,21 +349,25 @@ mod tests {
     fn headers_summarise_release_and_next_release() {
         let b = release_board();
         assert_eq!(
-            column_header(&b, Column::Live, Some("Shop")).as_deref(),
-            Some("25 Sep · #150 · v1.2.1 · 4 changes")
+            column_header(&b, Column::Live, Some("Shop")),
+            vec![
+                "25 Sep · #150 · v1.2.1 · 4 changes",
+                "25 Sep #150 v1.2.1",
+                "25 Sep #150"
+            ]
         );
         assert_eq!(
-            column_header(&b, Column::Staging, Some("Shop")).as_deref(),
-            Some("1 to promote · 1 db change")
+            column_header(&b, Column::Staging, Some("Shop")),
+            vec!["1 to promote · 1 db change", "1 ready · 1 db", "1 · 1 db"]
         );
         assert_eq!(
-            column_header(&b, Column::Staging, Some("Site")).as_deref(),
-            Some("not used")
+            column_header(&b, Column::Staging, Some("Site")),
+            vec!["not used"]
         );
-        assert_eq!(column_header(&b, Column::Dev, Some("Shop")), None);
+        assert!(column_header(&b, Column::Dev, Some("Shop")).is_empty());
         assert_eq!(
-            column_header(&b, Column::Live, None).as_deref(),
-            Some("4 changes in 1 release")
+            column_header(&b, Column::Live, None),
+            vec!["4 changes in 1 release", "1 release"]
         );
     }
 

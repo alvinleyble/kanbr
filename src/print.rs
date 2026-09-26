@@ -83,7 +83,7 @@ pub fn render_text(board: &Board, config: &Config, tab: Option<&str>, now: i64) 
     for column in Column::ALL {
         let cards = board.column_cards(column, tab);
         let _ = write!(out, "\n{} ({})", config.label(column), cards.len());
-        match column_header(board, column, tab) {
+        match column_header(board, column, tab).first() {
             Some(h) => {
                 let _ = writeln!(out, " — {h}");
             }

@@ -17,7 +17,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::dates::now_epoch;
@@ -854,10 +854,16 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
         let column = Column::ALL[ci];
-        if let Some(meta) = app
+        let forms = app
             .board
             .as_ref()
-            .and_then(|b| column_header(b, column, app.tab_project()))
+            .map(|b| column_header(b, column, app.tab_project()))
+            .unwrap_or_default();
+        let room = (inner.width as usize).saturating_sub(1);
+        if let Some(meta) = forms
+            .iter()
+            .find(|m| text_width(m) <= room)
+            .or(forms.last())
         {
             let style = if meta == "not used" {
                 DIM
@@ -1151,10 +1157,12 @@ fn render_notes(app: &App, f: &mut Frame, area: Rect) {
     let Some(board) = &app.board else { return };
     let text = release_notes(board, app.tab_project());
     let lines: Vec<Line> = text.lines().map(|l| Line::raw(l.to_owned())).collect();
-    let r = centered(area, 80, 80, 40, 10);
-    // Top and bottom rules only, so selecting the text copies no borders.
+    // Full width, with top and bottom rules only, so selecting the text copies
+    // no borders and no board beside it.
+    let r = centered(area, 100, 80, 40, 10);
     let mut block = Block::new()
         .borders(Borders::TOP | Borders::BOTTOM)
+        .padding(Padding::horizontal(2))
         .border_style(Style::new().fg(Color::Cyan))
         .title(Span::styled(
             " Release notes · c copy · select with the mouse · esc to close ",

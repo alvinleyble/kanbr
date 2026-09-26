@@ -13,6 +13,9 @@
 //!   that lane, or a rebased copy of that lane's patches;
 //! - a **back-merge**: a higher lane merged back down.
 //!
+//! A lane fast-forwarded to a higher lane's promotion of it is read through
+//! that promotion's merged side, so its own landings stay its own.
+//!
 //! A change has reached a lane when its landing commit is an ancestor of the
 //! lane (merge and fast-forward promotions), an ancestor of the source point
 //! a squash promotion carried, or when a rebased copy of its patches landed
@@ -220,7 +223,7 @@ pub fn analyze_refs(
         if lanes.iter().any(|l| l.branch == *branch) {
             continue;
         }
-        let log = git.first_parent_log(&r.sha, SCAN)?;
+        let log = own_history(git, &r.sha, branch)?;
         let reach = git.reachable(&[&r.sha], REACH)?;
         let index = log
             .iter()
@@ -292,6 +295,27 @@ struct Analysis<'a> {
     /// only when a copy exists.
     pids: Option<HashMap<String, Vec<String>>>,
     promotions: Promotions<'a>,
+}
+
+/// The first-parent landings of `branch` from `tip`, newest first. When the
+/// branch was fast-forwarded to a higher lane, the merges that promoted it
+/// there are not its own landings: its history continues through what each
+/// one merged.
+fn own_history(git: &Git, tip: &str, branch: &str) -> Result<Vec<Commit>, String> {
+    let mut log = git.first_parent_log(tip, SCAN)?;
+    let mut i = 0;
+    while i < log.len() {
+        let synced =
+            log[i].parents.len() > 1 && pr_of(&log[i]).and_then(|p| p.2).as_deref() == Some(branch);
+        if synced {
+            let merged = log[i].parents[1].clone();
+            log.truncate(i);
+            log.extend(git.first_parent_log(&merged, SCAN - i)?);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(log)
 }
 
 /// How many landings at the head of `log` arrived together, and the position

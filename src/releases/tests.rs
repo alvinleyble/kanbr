@@ -554,8 +554,10 @@ fn a_merge_release_fast_forwarded_back_to_dev_keeps_its_pr() {
         (rel.pr, rel.fast_forward, rel.known),
         (Some(13), false, true)
     );
-    assert!(change(&pg, 13).in_release, "the card that carries #2");
-    assert!(!change(&pg, 12).in_release, "the card that carries #1");
+    assert!(change(&pg, 2).in_release);
+    assert!(!change(&pg, 1).in_release);
+    assert_eq!(pg.by_pr[&12], Role::Promotion);
+    assert_eq!(pg.by_pr[&13], Role::Promotion);
 }
 
 #[test]
@@ -604,7 +606,10 @@ fn a_fast_forward_release_after_dev_synced_to_staging() {
     );
     assert!(change(&pg, 1).in_release);
     assert!(change(&pg, 2).in_release);
-    assert!(change(&pg, 11).in_release, "the card that carries #3");
+    assert!(change(&pg, 3).in_release);
+    assert_eq!(change(&pg, 3).home, Column::Dev);
+    assert_eq!(change(&pg, 1).home, Column::Staging);
+    assert_eq!(pg.by_pr[&11], Role::Promotion);
     assert!(!change(&pg, 5).in_release);
 }
 

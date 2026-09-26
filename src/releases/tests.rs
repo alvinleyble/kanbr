@@ -639,6 +639,69 @@ fn a_fast_forward_release_after_a_back_merge_starts_at_the_last_release() {
     assert!(!change(&pg, 1).in_release);
 }
 
+/// Merges fork branch `fork` (off `from`) into `base` as PR `n`, headed
+/// `owner/head` the way GitHub names a fork's branch.
+fn merge_fork(r: &Repo, base: &str, from: &str, n: u64, head: &str) {
+    let fork = format!("fork-{n}");
+    r.git(&["branch", &fork, from]);
+    r.checkout(&fork);
+    r.commit(&format!("f{n}a"), "a\n", "fork work a");
+    r.commit(&format!("f{n}b"), "b\n", "fork work b");
+    r.checkout(base);
+    r.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        &fork,
+        "-m",
+        &format!("Merge pull request #{n} from {head}"),
+        "-m",
+        "Fork work",
+    ]);
+}
+
+#[test]
+fn a_fork_pr_named_like_the_live_branch_is_a_release_of_its_own() {
+    for lanes in ["liveonly", "threelanes"] {
+        let r = if lanes == "liveonly" {
+            Repo::new("forkmain-live")
+        } else {
+            three_lanes("forkmain-three")
+        };
+        let forked = r.sha("main");
+        r.merge_pr("main", 5, "Five", &["five"]);
+        r.merge_pr("main", 6, "Six", &["six"]);
+        merge_fork(&r, "main", &forked, 7, "bob/main");
+
+        let pg = r.analyze();
+        let rel = pg.release.as_ref().unwrap();
+        assert_eq!((rel.pr, rel.fast_forward), (Some(7), false), "{lanes}");
+        assert_eq!(rel.commit, r.sha("main"), "{lanes}");
+        assert!(change(&pg, 7).in_release, "{lanes}");
+        for pr in [5, 6] {
+            assert_eq!(change(&pg, pr).column, Column::Live, "{lanes}");
+            assert!(!change(&pg, pr).in_release, "{lanes}");
+        }
+    }
+}
+
+#[test]
+fn a_fork_pr_named_like_dev_stays_a_dev_change() {
+    let r = three_lanes("forkdev");
+    let forked = r.sha("dev");
+    r.merge_pr("dev", 1, "One", &["one"]);
+    merge_fork(&r, "dev", &forked, 8, "bob/dev");
+    r.merge_pr("dev", 2, "Two", &["two"]);
+
+    let pg = r.analyze();
+    for pr in [1, 8, 2] {
+        assert_eq!(
+            (change(&pg, pr).home, change(&pg, pr).column),
+            (Column::Dev, Column::Dev)
+        );
+    }
+}
+
 #[test]
 fn a_project_without_staging_goes_from_dev_to_live() {
     let r = Repo::new("devlive");

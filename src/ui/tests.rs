@@ -43,7 +43,7 @@ fn renders_six_columns_tabs_and_waiting_strip() {
         assert!(screen.contains(title), "missing column {title}\n{screen}");
     }
     assert!(screen.contains("1 All"), "{screen}");
-    assert!(screen.contains("3 waiting on you"), "{screen}");
+    assert!(screen.contains("4 waiting on you"), "{screen}");
     assert!(screen.contains("opus-5-5"), "{screen}");
 }
 
@@ -86,7 +86,7 @@ fn clicking_a_tab_selects_it() {
 fn w_jumps_through_every_waiting_card() {
     let mut a = app();
     let mut seen = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         press(&mut a, KeyCode::Char('w'));
         let c = a.selected_card().unwrap();
         assert!(c.decision, "{} is not waiting", c.id);
@@ -94,7 +94,7 @@ fn w_jumps_through_every_waiting_card() {
     }
     seen.sort();
     seen.dedup();
-    assert_eq!(seen.len(), 3);
+    assert_eq!(seen.len(), 4);
 }
 
 #[test]

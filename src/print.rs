@@ -117,7 +117,7 @@ mod tests {
         ] {
             assert!(text.contains(heading), "{heading}\n{text}");
         }
-        assert!(text.contains("⚑ 3 waiting on you"), "{text}");
+        assert!(text.contains("⚑ 4 waiting on you"), "{text}");
         assert!(text.contains("legacy (2, halted)"), "{text}");
         assert!(text.contains("[after kanbr-1-board]"), "{text}");
         assert!(text.contains("Site 2nd #15"), "{text}");

@@ -69,7 +69,10 @@ pub(crate) fn now() -> i64 {
 }
 
 pub(crate) fn fixture_board() -> Board {
-    let snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    board_from(&serde_json::from_str(FIXTURE).unwrap())
+}
+
+fn board_from(snap: &Value) -> Board {
     let env = fake_env();
     let config = Config::default();
     let registry = registry();
@@ -79,7 +82,7 @@ pub(crate) fn fixture_board() -> Board {
         now: now(),
         env: &env,
     };
-    build_board(&snap, &ctx)
+    build_board(snap, &ctx)
 }
 
 fn card<'a>(b: &'a Board, id: &str) -> &'a Card {
@@ -446,4 +449,16 @@ fn pr_numbers_parse_from_urls() {
     assert_eq!(pr_number("https://github.com/o/r/pull/42"), Some(42));
     assert_eq!(pr_number("https://github.com/o/r/pull/42/files"), Some(42));
     assert_eq!(pr_number("https://example.com/"), None);
+}
+
+#[test]
+fn main_worker_pending_decision_waits_on_captain_in_building() {
+    let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    snap["tasks"][0]["hints"]["pending_decision"] = Value::Bool(true);
+    let b = board_from(&snap);
+    let c = card(&b, "kanbr-1-board");
+    assert_eq!(c.column, Column::Building);
+    assert_eq!(c.state, "needs decision");
+    assert!(c.decision);
+    assert!(b.waiting().iter().any(|w| w.id == "kanbr-1-board"));
 }

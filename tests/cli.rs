@@ -88,7 +88,7 @@ fn print_shows_the_board() {
     ] {
         assert!(text.contains(heading), "{heading}\n{text}");
     }
-    assert!(text.contains("⚑ 3 waiting on you"), "{text}");
+    assert!(text.contains("⚑ 4 waiting on you"), "{text}");
     assert!(text.contains("Tabs: All ("), "{text}");
 }
 

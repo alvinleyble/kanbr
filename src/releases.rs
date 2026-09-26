@@ -330,6 +330,7 @@ impl Analysis<'_> {
                 .iter()
                 .any(|lane| lane.index.contains_key(&l.sha));
         let mut prev = landing;
+        let mut prev_tip = None;
         let mut promotion = None;
         let mut known = true;
         let mut fast_forward = false;
@@ -339,21 +340,26 @@ impl Analysis<'_> {
                 .as_deref()
                 .and_then(|w| (self.promotions)(w, &self.lanes[top].branch, &l.sha));
             let lane = &self.lanes[top];
-            let earlier = |sha: &str| lane.index.get(sha).copied().filter(|p| *p > 0);
+            let earlier = |sha: &str| sha != l.sha && self.git.is_ancestor(sha, &l.sha);
             let boundary = promotion
                 .as_ref()
-                .and_then(|(_, base)| earlier(base))
+                .map(|(_, base)| base.clone())
+                .filter(|b| earlier(b))
                 .or_else(|| {
                     self.git
                         .reflog(&lane.r.refname)
-                        .iter()
-                        .find(|s| **s != l.sha)
-                        .and_then(|s| earlier(s))
+                        .into_iter()
+                        .find(|s| *s != l.sha)
+                        .filter(|s| earlier(s))
                 });
-            if boundary != landing {
+            let at = boundary.as_ref().and_then(|b| lane.index.get(b).copied());
+            if boundary.is_none() || at != landing {
                 fast_forward = true;
                 known = boundary.is_some();
-                prev = boundary;
+                prev = at;
+                if at.is_none() {
+                    prev_tip = boundary;
+                }
             }
         }
         // What each lane holds now; the lowest lane is never a target.
@@ -364,8 +370,9 @@ impl Analysis<'_> {
         for j in 1..n {
             tips.push(self.evidence(j, 0)?);
         }
-        let before = match prev {
-            Some(p) if live => Some(self.evidence(top, p)?),
+        let before = match (prev, prev_tip) {
+            (Some(p), _) if live => Some(self.evidence(top, p)?),
+            (None, Some(sha)) => Some(self.evidence_from(top, &sha)?),
             _ => None,
         };
         for j in 0..n {
@@ -654,6 +661,25 @@ impl Analysis<'_> {
         };
         let copies = self.originals(&copies)?;
         Ok(Evidence { reach, copies })
+    }
+
+    /// What lane `j` contained at `sha`, a former tip that is no longer on
+    /// its first-parent log.
+    fn evidence_from(&mut self, j: usize, sha: &str) -> Result<Evidence, String> {
+        let reach = self.git.reachable(&[sha], REACH)?;
+        let pos = self.lanes[j]
+            .log
+            .iter()
+            .position(|c| reach.contains(&c.sha));
+        let mut ev = match pos {
+            Some(p) => self.evidence(j, p)?,
+            None => Evidence {
+                reach: HashSet::new(),
+                copies: HashSet::new(),
+            },
+        };
+        ev.reach.extend(reach);
+        Ok(ev)
     }
 
     /// Gathers the squash sources and rebased copies behind lane `j` from

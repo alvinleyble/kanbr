@@ -554,6 +554,8 @@ fn a_merge_release_fast_forwarded_back_to_dev_keeps_its_pr() {
         (rel.pr, rel.fast_forward, rel.known),
         (Some(13), false, true)
     );
+    assert!(change(&pg, 13).in_release, "the card that carries #2");
+    assert!(!change(&pg, 12).in_release, "the card that carries #1");
 }
 
 #[test]
@@ -602,7 +604,34 @@ fn a_fast_forward_release_after_dev_synced_to_staging() {
     );
     assert!(change(&pg, 1).in_release);
     assert!(change(&pg, 2).in_release);
+    assert!(change(&pg, 11).in_release, "the card that carries #3");
     assert!(!change(&pg, 5).in_release);
+}
+
+#[test]
+fn a_fast_forward_release_after_a_back_merge_starts_at_the_last_release() {
+    let r = three_lanes("ffbackmerge");
+    r.squash_pr("staging", 1, "feat: one", "one");
+    r.merge_promote("staging", "main", 10);
+    r.checkout("staging");
+    r.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "main",
+        "-m",
+        "Merge main into staging",
+    ]);
+    r.squash_pr("staging", 2, "feat: two", "two");
+    r.checkout("main");
+    r.git(&["merge", "-q", "--ff-only", "staging"]);
+
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!((rel.fast_forward, rel.known), (true, true));
+    assert_eq!(change(&pg, 2).column, Column::Live);
+    assert!(change(&pg, 2).in_release);
+    assert!(!change(&pg, 1).in_release);
 }
 
 #[test]

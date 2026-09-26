@@ -326,7 +326,7 @@ pub fn project_check(name: &str, pg: &ProjectGit, config: &Config, now: i64, sho
         }
         if !r.known {
             detail.push_str(
-                " (a fast-forward whose start is unknown: gh found no promotion PR and the ref has no reflog)",
+                " (a fast-forward whose start is unknown: neither gh's last promotion PR nor the ref's reflog names an earlier tip)",
             );
         }
     }

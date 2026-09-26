@@ -319,19 +319,16 @@ impl Analysis<'_> {
         let live = self.lanes[top].column == Column::Live;
         let (_, landing) = release_group(&self.lanes[top].log);
         let l = self.lanes[top].log[0].clone();
-        // A merged PR from a lower lane that now holds the tip landed on the
-        // Live branch and was fast-forwarded back down.
-        let merged_from = pr_of(&l).and_then(|p| p.2);
-        let lower: Vec<&Lane> = self.lanes[..top]
-            .iter()
-            .filter(|lane| lane.index.contains_key(&l.sha))
-            .collect();
+        // A merged PR from the lane that promotes into Live landed on Live
+        // itself, even when a lower lane was later fast-forwarded to it.
+        let promoted_here = top > 0
+            && pr_of(&l).and_then(|p| p.2).as_deref() == Some(self.lanes[top - 1].branch.as_str());
         let candidate = live
             && landing.is_some()
-            && !lower.is_empty()
-            && !lower
+            && !promoted_here
+            && self.lanes[..top]
                 .iter()
-                .any(|lane| merged_from.as_deref() == Some(lane.branch.as_str()));
+                .any(|lane| lane.index.contains_key(&l.sha));
         let mut prev = landing;
         let mut promotion = None;
         let mut known = true;

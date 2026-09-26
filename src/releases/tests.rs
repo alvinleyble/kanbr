@@ -548,16 +548,61 @@ fn a_merge_release_fast_forwarded_back_to_dev_keeps_its_pr() {
     r.checkout("dev");
     r.git(&["merge", "-q", "--ff-only", "main"]);
 
-    let check = |pg: &ProjectGit| {
-        let rel = pg.release.as_ref().unwrap();
-        assert_eq!(
-            (rel.pr, rel.fast_forward, rel.known),
-            (Some(13), false, true)
-        );
-    };
-    check(&r.analyze());
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!(
+        (rel.pr, rel.fast_forward, rel.known),
+        (Some(13), false, true)
+    );
+}
+
+#[test]
+fn a_staging_merge_release_fast_forwarded_back_to_dev_keeps_its_pr_and_changes() {
+    let r = three_lanes("syncbackstaging");
+    r.squash_pr("staging", 1, "feat: one", "one");
+    r.merge_promote("staging", "main", 11);
+    r.squash_pr("staging", 2, "feat: two", "two");
+    r.merge_promote("staging", "main", 12);
+    r.checkout("dev");
+    r.git(&["merge", "-q", "--ff-only", "main"]);
     fs::remove_file(r.dir.join(".git/logs/refs/heads/main")).unwrap();
-    check(&r.analyze());
+
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!(
+        (rel.pr, rel.fast_forward, rel.known),
+        (Some(12), false, true)
+    );
+    assert!(change(&pg, 2).in_release);
+    assert!(!change(&pg, 1).in_release);
+}
+
+#[test]
+fn a_fast_forward_release_after_dev_synced_to_staging() {
+    let r = three_lanes("ffsynced");
+    let ff = |branch: &str, to: &str| {
+        r.checkout(branch);
+        r.git(&["merge", "-q", "--ff-only", to]);
+    };
+    r.squash_pr("staging", 5, "feat: earlier", "e");
+    ff("main", "staging");
+    r.squash_pr("staging", 1, "feat: one", "one");
+    r.squash_pr("staging", 2, "feat: two", "two");
+    r.merge_pr("dev", 3, "Three", &["three"]);
+    r.merge_promote("dev", "staging", 11);
+    ff("dev", "staging");
+    ff("main", "staging");
+
+    let pg = r.analyze();
+    let rel = pg.release.as_ref().unwrap();
+    assert_eq!(
+        (rel.pr, rel.fast_forward, rel.known),
+        (None, true, true),
+        "#11 is a staging PR, not the release"
+    );
+    assert!(change(&pg, 1).in_release);
+    assert!(change(&pg, 2).in_release);
+    assert!(!change(&pg, 5).in_release);
 }
 
 #[test]

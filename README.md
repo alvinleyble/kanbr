@@ -336,7 +336,7 @@ kanbr                        # open the board
 kanbr print                  # print the board once as text
 kanbr print --tab Leyble-Hub # one project only
 kanbr notes --tab Leyble-Hub # release notes for the latest Live release
-kanbr doctor                 # check every Firstmate surface Kanbr reads
+kanbr doctor                 # check every Firstmate surface Kanbr reads or writes
 kanbr open                   # open the board in its own Herdr workspace (the plugin action)
 ```
 
@@ -443,7 +443,7 @@ It checks:
   ok    answer intake     bin/fm-captain-hold.sh answers --source takes keyed answers: decisions can be answered in place
   ok    project git       firstmate: origin/main; latest release 25 Sep #9; fetched 18h ago
   ok    project git       Leyble-Hub: origin/dev origin/staging origin/main; latest release 10 Sep #122 v1.2.1; 2 database change(s) waiting in staging; fetched 38m ago
-  ok    gh                installed and signed in; asked only about a merged PR whose merge message has no PR number, and the promotion PR behind a fast-forward release
+  ok    gh                installed and signed in; asked about a merged PR whose merge message has no PR number, the promotion PR behind a fast-forward release, and a PR's checks before a merge request
   ok    board             36 cards (Booked 12 · Ready 2 · Building 2 · Dev 0 · Staging 12 · Live 8), 6 waiting on you, 7 tabs
 ```
 

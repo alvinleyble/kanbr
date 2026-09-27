@@ -229,7 +229,7 @@ pub fn plan(board: &Board, config: &Config, card: &Card, to: Column) -> Result<P
         .filter(|b| !b.is_empty());
     let moves = if action == Action::Promote {
         board
-            .column_cards(from, Some(&card.project))
+            .changes_in(from, Some(&card.project))
             .iter()
             .map(|c| match c.pr_number {
                 Some(n) => format!("#{n} {}", c.title),

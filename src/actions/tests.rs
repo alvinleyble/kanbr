@@ -124,6 +124,31 @@ fn each_drag_means_one_request() {
 }
 
 #[test]
+fn a_promotion_moves_only_the_lanes_changes() {
+    let mut b = board();
+    let mut promo = card(&b, "Shop#144");
+    promo.id = "shop-promote-dev".into();
+    promo.title = "Promote dev to staging".into();
+    promo.pr_number = Some(148);
+    promo.promotion = true;
+    let mut report = card(&b, "Shop#144");
+    report.id = "shop-emulator".into();
+    report.title = "Set up emulator build".into();
+    report.pr_number = None;
+    report.not_release = true;
+    b.cards.extend([promo, report]);
+    assert_eq!(b.column_cards(Column::Staging, Some("Shop")).len(), 3);
+
+    let promote = plan_of(&b, "Shop#144", Column::Live).unwrap();
+    assert_eq!(promote.moves, vec!["#144 feat: saved carts"]);
+    assert_eq!(
+        promote.moves.len(),
+        b.changes_in(Column::Staging, Some("Shop")).len(),
+        "the request counts what the lane header counts"
+    );
+}
+
+#[test]
 fn passphrase_lanes_come_from_the_config() {
     let b = board();
     let mut config = Config {

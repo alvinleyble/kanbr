@@ -447,6 +447,7 @@ fn a_drag_is_a_request_with_a_masked_passphrase() {
 
     a.apply(Msg::Action(Outcome::Requested {
         card_id: "Shop#144".into(),
+        request_id: request_id.clone(),
         note_id: "n1".into(),
         warning: None,
     }));
@@ -578,14 +579,125 @@ fn enter_on_a_waiting_card_answers_it_in_place() {
 }
 
 #[test]
+fn the_worker_pick_is_answered_in_place_while_the_request_stays_open() {
+    let mut a = release_app();
+    a.request_move("site-dark-mode", Column::Building);
+    assert_eq!(a.modal, Modal::Confirm);
+    press(&mut a, KeyCode::Enter);
+    let Some(Job::Request { request_id, .. }) = a.jobs.pop() else {
+        panic!("no request job")
+    };
+    a.apply(Msg::Action(Outcome::Requested {
+        card_id: "site-dark-mode".into(),
+        request_id: request_id.clone(),
+        note_id: "n3".into(),
+        warning: None,
+    }));
+    // Firstmate holds the task for the captain's model pick.
+    let mut board = a.board.clone().unwrap();
+    let card = board
+        .cards
+        .iter_mut()
+        .find(|c| c.id == "site-dark-mode")
+        .unwrap();
+    card.decision = true;
+    card.ask = Some(Ask::Hold {
+        home: Some(PathBuf::from("/mates/alpha")),
+        work_item: true,
+    });
+    a.apply(Msg::Loaded(Box::new(Ok(board.clone()))));
+    assert!(a.select_card("site-dark-mode"));
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.modal, Modal::Decide("site-dark-mode".into()));
+    typing(&mut a, "gpt-5.5");
+    press(&mut a, KeyCode::Enter);
+    let Some(Job::Answer(job)) = a.jobs.pop() else {
+        panic!("no answer job")
+    };
+    assert_eq!(job.answer, "gpt-5.5");
+    assert!(job.release, "held work resumes");
+    let p = a.tracker.get("site-dark-mode").unwrap();
+    assert_eq!(p.request_id, request_id, "the move stays open");
+    assert!(matches!(
+        p.kind,
+        Kind::Move {
+            to: Column::Building,
+            ..
+        }
+    ));
+    assert!(a.tracker.sending());
+    // One answer at a time.
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.modal, Modal::Details(_)));
+    press(&mut a, KeyCode::Esc);
+
+    // An answer the intake refused is reported; the move stays open.
+    a.apply(Msg::Action(Outcome::NotSent {
+        card_id: "site-dark-mode".into(),
+        request_id: job.request_id.clone(),
+        reason: "the keyed-answer intake did not take it: busy".into(),
+    }));
+    let p = a.tracker.get("site-dark-mode").unwrap();
+    assert_eq!(
+        (p.request_id.as_str(), p.answering.as_deref()),
+        (request_id.as_str(), None)
+    );
+    let (flash, ok, _) = a.tracker.flash.clone().unwrap();
+    assert!(!ok && flash.contains("busy"), "{flash}");
+
+    press(&mut a, KeyCode::Enter);
+    typing(&mut a, "gpt-5.5");
+    press(&mut a, KeyCode::Enter);
+    let Some(Job::Answer(job)) = a.jobs.pop() else {
+        panic!("no answer job")
+    };
+    a.apply(Msg::Action(Outcome::Answered {
+        card_id: "site-dark-mode".into(),
+        request_id: job.request_id,
+        detail: "released".into(),
+        note_id: None,
+        warning: None,
+    }));
+    assert!(!a.tracker.sending());
+    let (flash, ok, _) = a.tracker.flash.clone().unwrap();
+    assert!(ok && flash.contains("answered (released)"), "{flash}");
+    assert!(matches!(
+        a.tracker.mark("site-dark-mode"),
+        Some(Mark::Open(t)) if t.contains("requested: worker")
+    ));
+    // The card moves only once the board shows the worker.
+    let card = board
+        .cards
+        .iter_mut()
+        .find(|c| c.id == "site-dark-mode")
+        .unwrap();
+    card.decision = false;
+    card.ask = None;
+    card.column = Column::Building;
+    a.apply(Msg::Loaded(Box::new(Ok(board))));
+    assert!(a.tracker.get("site-dark-mode").is_none());
+    assert_eq!(
+        a.tracker.mark("site-dark-mode"),
+        Some(Mark::Done("✓ moved to Building".into()))
+    );
+}
+
+#[test]
 fn requests_time_out_and_replies_are_polled() {
     let mut a = release_app();
     assert!(a.select_card("site-launch-post"));
     press(&mut a, KeyCode::Char('m'));
     press(&mut a, KeyCode::Enter);
     a.jobs.clear();
+    let request_id = a
+        .tracker
+        .get("site-launch-post")
+        .unwrap()
+        .request_id
+        .clone();
     a.apply(Msg::Action(Outcome::Requested {
         card_id: "site-launch-post".into(),
+        request_id,
         note_id: "n7".into(),
         warning: None,
     }));

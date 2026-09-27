@@ -162,7 +162,8 @@ words.
 
 - **A task held for your call** is answered through Firstmate's keyed-answer
   intake, `bin/fm-captain-hold.sh answers --source "kanbr board"`, in the home that
-  owns the task (a second mate's call goes to that second mate's home), exactly
+  owns the task (a second mate's call goes to that second mate's home; when the
+  snapshot does not name that home, Enter shows the details instead), exactly
   like Captain's Deck. `Tab` picks what the answer does: **resume the work**
   (release the hold, the default for held work) or **close the call** (done, the
   default for a question-only call). The intake records your words in the task and
@@ -182,7 +183,7 @@ that step. Kanbr first shows what it will ask, then sends it when you press `Ent
 | --- | --- |
 | Booked to Ready | mark it talked through and ready: lift its hold |
 | Ready to Building | a worker: Firstmate recommends two models and puts the pick to you as a decision on the card, which you answer in place (while you pick, the card waits in Booked with its red badge, still `requested`) |
-| Building to Dev | your merge word for the card's PR. Kanbr reads the PR's checks first (`gh pr view`) and sends the word only when every check is green; if they are red, still running, or cannot be read, the card snaps back with the reason |
+| Building to Dev | your merge word for the card's PR. Kanbr reads the PR's checks first (`gh pr view`) and sends the word only when every check is green; if they are red, still running, or cannot be read, the card snaps back with the reason. A PR with no checks reported (CI has not registered yet, or the repository has none) is not green: the card snaps back too |
 | Dev to Staging | promote the project's dev branch to staging; Kanbr prompts for the staging passphrase |
 | Staging to Live | promote the project's staging branch to main; Kanbr prompts for the main passphrase |
 

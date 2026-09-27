@@ -583,15 +583,14 @@ impl<'a> Builder<'a> {
     }
 
     /// How a captain call held on a task of `owner` is answered: through the
-    /// keyed-answer intake of the home that owns the task.
-    fn hold_ask(&self, owner: &Owner, work_item: bool) -> Ask {
-        Ask::Hold {
-            home: match owner {
-                Owner::Main => None,
-                Owner::Secondmate(id) => self.mate_home_by_id.get(id).cloned(),
-            },
-            work_item,
-        }
+    /// keyed-answer intake of the home that owns the task. `None` when that
+    /// home is unknown.
+    fn hold_ask(&self, owner: &Owner, work_item: bool) -> Option<Ask> {
+        let home = match owner {
+            Owner::Main => None,
+            Owner::Secondmate(id) => Some(self.mate_home_by_id.get(id)?.clone()),
+        };
+        Some(Ask::Hold { home, work_item })
     }
 
     /// Finds a merged card's PR in its project's history: by the PR number in
@@ -717,11 +716,11 @@ impl<'a> Builder<'a> {
         if let Some(b) = str_at(rec, "body_excerpt") {
             details.push(("Notes", b.to_owned()));
         }
-        let ask = decision.then(|| {
-            // A row created as a captain call is a question; any other kind is
-            // held work that resumes once answered.
-            self.hold_ask(&owner, str_at(rec, "kind") != Some("captain"))
-        });
+        // A row created as a captain call is a question; any other kind is
+        // held work that resumes once answered.
+        let ask = decision
+            .then(|| self.hold_ask(&owner, str_at(rec, "kind") != Some("captain")))
+            .flatten();
         Some(Card {
             pr_number: pr_url.as_deref().and_then(pr_number),
             pr_url,
@@ -841,7 +840,7 @@ impl<'a> Builder<'a> {
         }
         let held = bool_at(r, "captain_actionable");
         let ask = if held {
-            Some(self.hold_ask(&owner, true))
+            self.hold_ask(&owner, true)
         } else if pending {
             Some(Ask::Worker { questions })
         } else {

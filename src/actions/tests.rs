@@ -304,8 +304,12 @@ fn inbox_receipts_and_checks_parse() {
     let merged = parse_checks(r#"{"state":"MERGED","isDraft":false}"#).unwrap();
     assert!(merged.problem().unwrap().contains("already merged"));
     let none = parse_checks(r#"{"state":"OPEN","isDraft":false,"statusCheckRollup":[]}"#).unwrap();
-    assert_eq!(none.problem(), None);
-    assert_eq!(none.summary(), "no checks reported on the PR");
+    assert_eq!(
+        none.problem().unwrap(),
+        "checks are not green: no checks reported on the PR yet"
+    );
+    let unreported = parse_checks(r#"{"state":"OPEN","isDraft":false}"#).unwrap();
+    assert!(unreported.problem().is_some());
 }
 
 /// Records every call; answers from canned results.
@@ -382,6 +386,23 @@ fn a_merge_is_asked_for_only_on_green_checks() {
     );
     assert!(red.notes.borrow().is_empty(), "nothing reaches Firstmate");
 
+    let unchecked = Fake {
+        checks: Some(Ok(Checks {
+            state: "OPEN".into(),
+            ..Checks::default()
+        })),
+        ..Fake::default()
+    };
+    let out = run_job(&unchecked, job(&plan));
+    assert!(
+        matches!(&out, Outcome::NotSent { reason, .. } if reason.contains("no checks reported") && reason.contains("waits for green checks")),
+        "{out:?}"
+    );
+    assert!(
+        unchecked.notes.borrow().is_empty(),
+        "nothing reaches Firstmate"
+    );
+
     let unknown = Fake::default();
     let out = run_job(&unknown, job(&plan));
     assert!(
@@ -399,6 +420,7 @@ fn a_merge_is_asked_for_only_on_green_checks() {
         out,
         Outcome::Requested {
             card_id: "shop-force-update".into(),
+            request_id: "kanbr-merge-x-1".into(),
             note_id: "note-1".into(),
             warning: None
         }
@@ -474,6 +496,7 @@ fn a_held_call_is_answered_through_the_intake_of_its_home_then_firstmate_is_woke
         out,
         Outcome::Answered {
             card_id: "site-pricing-page".into(),
+            request_id: "kanbr-answer-site-pricing-page-1".into(),
             detail: "closed: done".into(),
             note_id: None,
             warning: None

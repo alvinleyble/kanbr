@@ -595,15 +595,14 @@ impl Checks {
                 self.pending.join(", ")
             ));
         }
+        if parts.is_empty() && self.passed == 0 {
+            parts.push("no checks reported on the PR yet".to_owned());
+        }
         (!parts.is_empty()).then(|| format!("checks are not green: {}", parts.join("; ")))
     }
 
     pub fn summary(&self) -> String {
-        if self.passed == 0 {
-            "no checks reported on the PR".to_owned()
-        } else {
-            format!("{} check(s) green", self.passed)
-        }
+        format!("{} check(s) green", self.passed)
     }
 }
 
@@ -829,18 +828,21 @@ pub enum Outcome {
     /// The request note is saved; `warning` says when Firstmate was not woken.
     Requested {
         card_id: String,
+        request_id: String,
         note_id: String,
         warning: Option<String>,
     },
     /// Nothing reached Firstmate, for this reason.
     NotSent {
         card_id: String,
+        request_id: String,
         reason: String,
     },
     /// A decision answer: recorded by the intake, or delivered as a request
     /// note (`note_id`) for Firstmate to relay.
     Answered {
         card_id: String,
+        request_id: String,
         detail: String,
         note_id: Option<String>,
         warning: Option<String>,
@@ -864,6 +866,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                         if let Some(problem) = c.problem() {
                             return Outcome::NotSent {
                                 card_id,
+                                request_id,
                                 reason: format!("{problem}; the merge word waits for green checks"),
                             };
                         }
@@ -876,6 +879,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                     Err(e) => {
                         return Outcome::NotSent {
                             card_id,
+                            request_id,
                             reason: format!(
                                 "cannot confirm the PR's checks are green ({e}); Kanbr gives the merge word only on green checks"
                             ),
@@ -895,6 +899,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
             match saved {
                 Ok(s) => Outcome::Requested {
                     card_id,
+                    request_id,
                     warning: (!s.announced).then(|| {
                         format!(
                             "request saved as note {}, but Firstmate was not woken: it waits for Firstmate's next check",
@@ -903,7 +908,11 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                     }),
                     note_id: s.note_id,
                 },
-                Err(reason) => Outcome::NotSent { card_id, reason },
+                Err(reason) => Outcome::NotSent {
+                    card_id,
+                    request_id,
+                    reason,
+                },
             }
         }
         Job::Answer(a) => match &a.ask {
@@ -913,6 +922,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                     Err(reason) => {
                         return Outcome::NotSent {
                             card_id: a.card_id,
+                            request_id: a.request_id,
                             reason,
                         };
                     }
@@ -932,6 +942,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                         };
                         Outcome::Answered {
                             card_id: a.card_id,
+                            request_id: a.request_id,
                             detail,
                             note_id: None,
                             warning,
@@ -939,6 +950,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                     }
                     Err(reason) => Outcome::NotSent {
                         card_id: a.card_id,
+                        request_id: a.request_id,
                         reason: format!("the keyed-answer intake did not take it: {reason}"),
                     },
                 }
@@ -948,6 +960,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                 match t.note(&a.request_id, body.as_bytes()) {
                     Ok(s) => Outcome::Answered {
                         card_id: a.card_id,
+                        request_id: a.request_id,
                         detail: format!("sent to Firstmate as note {}", s.note_id),
                         warning: (!s.announced).then(|| {
                             format!("note {} is saved but Firstmate was not woken", s.note_id)
@@ -956,6 +969,7 @@ pub fn run_job(t: &dyn Transport, job: Job) -> Outcome {
                     },
                     Err(reason) => Outcome::NotSent {
                         card_id: a.card_id,
+                        request_id: a.request_id,
                         reason,
                     },
                 }

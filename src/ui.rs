@@ -35,7 +35,7 @@ use crate::loader::Loader;
 use crate::model::{Ask, Board, Card, Column, Owner, TestBadge, Tone, assumed_lanes};
 use crate::notes::{column_header, details, release_notes};
 use crate::requests::{FLASH_SECS, Kind, Mark, Pending, Tracker};
-use crate::secret::Secret;
+use crate::secret::{self, Secret};
 
 const CARD_ROWS: u16 = 3;
 /// Rows above a column's cards: the title, the release line, and a rule.
@@ -407,8 +407,14 @@ impl App {
         let Some(card) = self.selected_card() else {
             return;
         };
-        let answerable =
-            card.decision && card.ask.is_some() && self.tracker.get(&card.id).is_none();
+        // A move stays open while its decision is answered (a worker's model
+        // pick); an answer already on its way blocks another.
+        let answerable = card.decision
+            && card.ask.is_some()
+            && self
+                .tracker
+                .get(&card.id)
+                .is_none_or(|p| matches!(p.kind, Kind::Move { .. }) && p.answering.is_none());
         if !answerable {
             return self.open_details();
         }
@@ -558,14 +564,8 @@ impl App {
             answer: d.input.trim().to_owned(),
             request_id: rid.clone(),
         };
-        self.tracker.start(Pending::new(
-            &job.card_id,
-            Kind::Answer {
-                hold: matches!(job.ask, Ask::Hold { .. }),
-            },
-            &rid,
-            now,
-        ));
+        let hold = matches!(job.ask, Ask::Hold { .. });
+        self.tracker.start_answer(&job.card_id, hold, &rid, now);
         self.jobs.push(Job::Answer(job));
     }
 
@@ -619,21 +619,30 @@ impl App {
         }
     }
 
-    /// Pasted text goes into the open prompt, as one line.
-    pub fn handle_paste(&mut self, text: &str) {
-        let flat = text.replace(['\r', '\n', '\t'], " ");
+    /// Pasted text goes into the open prompt, as one line. The pasted text is
+    /// wiped afterwards, since it may be a passphrase.
+    pub fn handle_paste(&mut self, text: String) {
+        let flat = |ch: char| {
+            if matches!(ch, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        };
         match self.modal {
             Modal::Confirm => {
                 if let Some(c) = self.confirm.as_mut()
                     && c.plan.passphrase.is_some()
                 {
-                    c.passphrase.push_str(flat.trim());
+                    for ch in text.trim().chars() {
+                        c.passphrase.push(flat(ch));
+                    }
                     c.error = None;
                 }
             }
             Modal::Decide(_) => {
                 if let Some(d) = self.decide.as_mut() {
-                    for ch in flat.chars() {
+                    for ch in text.chars().map(flat) {
                         if d.input.len() + ch.len_utf8() > actions::ANSWER_LIMIT {
                             break;
                         }
@@ -644,6 +653,7 @@ impl App {
             }
             _ => {}
         }
+        secret::wipe(text);
     }
 
     fn open_modal(&mut self, modal: Modal) {
@@ -2075,7 +2085,7 @@ pub fn run(loader: Loader) -> io::Result<()> {
                 match event::read()? {
                     Event::Key(k) => app.handle_key(k),
                     Event::Mouse(m) => app.handle_mouse(m),
-                    Event::Paste(text) => app.handle_paste(&text),
+                    Event::Paste(text) => app.handle_paste(text),
                     _ => {}
                 }
             }

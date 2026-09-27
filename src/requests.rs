@@ -60,6 +60,9 @@ pub struct Pending {
     /// Firstmate replied `done:`; the board has not caught up yet.
     pub reported_done: bool,
     pub warning: Option<String>,
+    /// The request id of a decision answer sent while this move stays open,
+    /// until its outcome is back.
+    pub answering: Option<String>,
 }
 
 impl Pending {
@@ -75,6 +78,7 @@ impl Pending {
             reply: None,
             reported_done: false,
             warning: None,
+            answering: None,
         }
     }
 
@@ -156,15 +160,44 @@ impl Tracker {
         self.pending.iter_mut().find(|p| p.card_id == card_id)
     }
 
+    fn by_request_mut(&mut self, request_id: &str) -> Option<&mut Pending> {
+        self.pending.iter_mut().find(|p| p.request_id == request_id)
+    }
+
     /// Whether a request is still being written to Firstmate.
     pub fn sending(&self) -> bool {
-        self.pending.iter().any(|p| p.sending)
+        self.pending
+            .iter()
+            .any(|p| p.sending || p.answering.is_some())
     }
 
     pub fn start(&mut self, p: Pending) {
         self.settled.retain(|s| s.card_id != p.card_id);
         self.pending.retain(|q| q.card_id != p.card_id);
         self.pending.push(p);
+    }
+
+    /// Starts an answer to `card_id`'s decision. A move still open for the
+    /// card stays open (the answer is its worker's model pick); the answer's
+    /// outcome then shows in the footer.
+    pub fn start_answer(&mut self, card_id: &str, hold: bool, request_id: &str, now: i64) {
+        match self.get_mut(card_id) {
+            Some(p) => p.answering = Some(request_id.to_owned()),
+            None => self.start(Pending::new(
+                card_id,
+                Kind::Answer { hold },
+                request_id,
+                now,
+            )),
+        }
+    }
+
+    fn answered_alongside(&mut self, request_id: &str) {
+        for p in &mut self.pending {
+            if p.answering.as_deref() == Some(request_id) {
+                p.answering = None;
+            }
+        }
     }
 
     fn settle(&mut self, card_id: &str, mark: Mark, now: i64) {
@@ -196,10 +229,11 @@ impl Tracker {
         match outcome {
             Outcome::Requested {
                 card_id,
+                request_id,
                 note_id,
                 warning,
             } => {
-                let Some(p) = self.get_mut(&card_id) else {
+                let Some(p) = self.by_request_mut(&request_id) else {
                     return;
                 };
                 p.sending = false;
@@ -217,23 +251,37 @@ impl Tracker {
                     ),
                 }
             }
-            Outcome::NotSent { card_id, reason } => self.refuse(&card_id, &reason, now),
+            Outcome::NotSent {
+                card_id,
+                request_id,
+                reason,
+            } => {
+                if self.by_request_mut(&request_id).is_some() {
+                    self.refuse(&card_id, &reason, now);
+                } else {
+                    self.answered_alongside(&request_id);
+                    self.say(format!("{card_id}: not sent: {reason}"), false, now);
+                }
+            }
             Outcome::Answered {
                 card_id,
+                request_id,
                 detail,
                 note_id,
                 warning,
             } => {
-                let Some(p) = self.get_mut(&card_id) else {
-                    return;
-                };
-                p.sending = false;
-                p.note_id = note_id;
-                p.warning = warning.clone();
-                let text = match warning {
+                let text = match &warning {
                     Some(w) => format!("{card_id}: answered; {w}"),
                     None => format!("{card_id}: answered ({detail})"),
                 };
+                match self.by_request_mut(&request_id) {
+                    Some(p) => {
+                        p.sending = false;
+                        p.note_id = note_id;
+                        p.warning = warning;
+                    }
+                    None => self.answered_alongside(&request_id),
+                }
                 self.say(text, true, now);
             }
             Outcome::Receipts(Ok(receipts)) => {
@@ -456,6 +504,7 @@ mod tests {
         t.on_outcome(
             Outcome::Requested {
                 card_id: booked.id.clone(),
+                request_id: "r1".into(),
                 note_id: "n1".into(),
                 warning: None,
             },
@@ -502,10 +551,11 @@ mod tests {
     fn a_refusal_snaps_back_with_the_reason_and_done_waits_for_the_board() {
         let mut t = Tracker::default();
         for (card, note) in [("a", "n1"), ("b", "n2"), ("c", "n3")] {
-            t.start(Pending::new(card, mv(Column::Staging), "r", 0));
+            t.start(Pending::new(card, mv(Column::Staging), card, 0));
             t.on_outcome(
                 Outcome::Requested {
                     card_id: card.into(),
+                    request_id: card.into(),
                     note_id: note.into(),
                     warning: None,
                 },
@@ -557,6 +607,7 @@ mod tests {
         t.on_outcome(
             Outcome::Requested {
                 card_id: "x".into(),
+                request_id: "r".into(),
                 note_id: "n9".into(),
                 warning: Some("request saved as note n9, but Firstmate was not woken".into()),
             },
@@ -580,6 +631,7 @@ mod tests {
         t.on_outcome(
             Outcome::NotSent {
                 card_id: "x".into(),
+                request_id: "r".into(),
                 reason: "checks are not green: 1 failing (ci)".into(),
             },
             1,

@@ -70,6 +70,13 @@ impl Secret {
     }
 }
 
+/// Overwrites a string that may hold a passphrase with zeros, then drops it.
+pub fn wipe(text: String) {
+    let mut bytes = text.into_bytes();
+    bytes.fill(0);
+    black_box(&bytes);
+}
+
 impl Default for Secret {
     fn default() -> Self {
         Secret::new()

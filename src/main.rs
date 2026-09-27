@@ -1,5 +1,6 @@
 //! Kanbr: a Kanban board for Firstmate work inside Herdr.
 
+mod actions;
 mod config;
 mod dates;
 mod doctor;
@@ -13,6 +14,8 @@ mod model;
 mod notes;
 mod print;
 mod releases;
+mod requests;
+mod secret;
 mod ui;
 
 use std::io::IsTerminal;
@@ -40,7 +43,9 @@ Options:
                   $XDG_CONFIG_HOME/kanbr/config or ~/.config/kanbr/config)
   --tab PROJECT   with print or notes: only that project
 
-Kanbr only reads Firstmate state; it never changes it.
+Kanbr never changes Firstmate state itself: a drag or a decision answer on
+the board is a request that Firstmate carries out through its own guarded
+scripts.
 ";
 
 #[derive(Debug, Default, PartialEq)]

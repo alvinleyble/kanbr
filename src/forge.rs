@@ -6,7 +6,8 @@
 //! message), to learn the commit the PR landed as, and about the promotion PR
 //! behind a fast-forward to the Live branch, to learn where the release
 //! starts. Answers for merged PRs never change, so they are cached for good;
-//! other answers for a while.
+//! other answers for a while. Before a merge request, a PR's checks are read
+//! so the captain's merge word is sent only when they are green.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -61,6 +62,17 @@ pub fn merged_commit(pr_url: &str) -> Result<Option<String>, GhError> {
         "if .state == \"MERGED\" then .mergeCommit.oid else \"\" end",
     ])?;
     Ok(parse_oid(&out))
+}
+
+/// A PR's state, draft flag, and checks, as `gh` prints them (JSON).
+pub fn pr_checks(pr_url: &str) -> Result<String, GhError> {
+    gh(&[
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "state,isDraft,statusCheckRollup",
+    ])
 }
 
 /// The merged PR into `branch` of the GitHub repository `web` that landed as

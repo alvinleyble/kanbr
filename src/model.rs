@@ -18,7 +18,10 @@
 //!   (reports, local tasks) is shown in the project's last lane until its next
 //!   release. Where the repository cannot be read, or a merged PR is not in
 //!   it yet, merged work falls back to the first lane for `finished_days`.
-//! - A captain decision is a red badge on the card, which stays in its real column.
+//! - A captain decision is a red badge on the card, which stays in its real
+//!   column. Each one records how the captain answers it in place (slice 3): a
+//!   task held for the captain through the keyed-answer intake of the home that
+//!   owns it, a worker that stopped to ask through a request to Firstmate.
 //! - Registered second mates' work is mixed into the same projects and columns
 //!   with a `2nd` tag.
 
@@ -82,6 +85,17 @@ pub fn landing_column(lanes: Lanes) -> Option<Column> {
     .find_map(|(used, c)| used.then_some(c))
 }
 
+/// The lanes assumed for a project whose repository cannot be read: only the
+/// last configured lane.
+pub fn assumed_lanes(config: &Config) -> Lanes {
+    let [dev, staging, live] = config.branches().map(|b| !b.is_empty());
+    Lanes {
+        live,
+        staging: staging && !live,
+        dev: dev && !staging && !live,
+    }
+}
+
 /// The last release lane the project uses, where finished work that was never
 /// merged (reports, local tasks) is shown.
 pub fn final_column(lanes: Lanes) -> Option<Column> {
@@ -111,6 +125,22 @@ pub enum TestBadge {
     Running,
 }
 
+/// How the captain answers a card's decision in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// A task held for the captain, answered through the keyed-answer intake
+    /// (`bin/fm-captain-hold.sh answers`) of the home that owns it: `None` is
+    /// the board's own home, otherwise a second mate's.
+    Hold {
+        home: Option<PathBuf>,
+        /// A held work item resumes when answered; a question-only call closes.
+        work_item: bool,
+    },
+    /// A worker that stopped to ask: Firstmate relays the answer. Each entry
+    /// is one open question as the worker's status line put it.
+    Worker { questions: Vec<String> },
+}
+
 /// How a card's state should read at a glance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -133,6 +163,8 @@ pub struct Card {
     pub pr_url: Option<String>,
     /// Waiting on the captain: the red badge and the waiting-on-you strip.
     pub decision: bool,
+    /// How that decision is answered in place, when it can be.
+    pub ask: Option<Ask>,
     pub grill: bool,
     /// Greyed: the project is halted or the item is parked.
     pub paused: bool,
@@ -369,6 +401,7 @@ fn outside_card(project: &str, g: &ProjectGit, c: &Change) -> Card {
         pr_number: c.pr,
         pr_url: c.pr.and_then(|n| g.pr_url(n)),
         decision: false,
+        ask: None,
         grill: false,
         paused: false,
         blocked_by: Vec::new(),
@@ -407,6 +440,8 @@ struct Builder<'a> {
     claimed: HashMap<String, HashSet<usize>>,
     /// Second-mate homes, for projects cloned only there.
     mate_homes: Vec<PathBuf>,
+    /// Each second mate's home by id, where its captain calls are answered.
+    mate_home_by_id: HashMap<String, PathBuf>,
     /// Projects whose finished cards were hidden because they use no lane.
     laneless: Vec<String>,
     /// Merged cards whose PR is not in their project's history yet.
@@ -443,6 +478,15 @@ impl<'a> Builder<'a> {
             mate_homes: arr_at(snap, "secondmate_current.records")
                 .iter()
                 .filter_map(|m| str_at(m, "home").map(PathBuf::from))
+                .collect(),
+            mate_home_by_id: arr_at(snap, "secondmate_current.records")
+                .iter()
+                .filter_map(|m| {
+                    Some((
+                        str_at(m, "id")?.to_owned(),
+                        PathBuf::from(str_at(m, "home")?),
+                    ))
+                })
                 .collect(),
             laneless: Vec::new(),
             unfetched: Vec::new(),
@@ -535,12 +579,18 @@ impl<'a> Builder<'a> {
     /// The lanes assumed when no repository can be read: only the last
     /// configured lane.
     fn assumed_lanes(&self) -> Lanes {
-        let [dev, staging, live] = self.ctx.config.branches().map(|b| !b.is_empty());
-        Lanes {
-            live,
-            staging: staging && !live,
-            dev: dev && !staging && !live,
-        }
+        assumed_lanes(self.ctx.config)
+    }
+
+    /// How a captain call held on a task of `owner` is answered: through the
+    /// keyed-answer intake of the home that owns the task. `None` when that
+    /// home is unknown.
+    fn hold_ask(&self, owner: &Owner, work_item: bool) -> Option<Ask> {
+        let home = match owner {
+            Owner::Main => None,
+            Owner::Secondmate(id) => Some(self.mate_home_by_id.get(id)?.clone()),
+        };
+        Some(Ask::Hold { home, work_item })
     }
 
     /// Finds a merged card's PR in its project's history: by the PR number in
@@ -666,6 +716,11 @@ impl<'a> Builder<'a> {
         if let Some(b) = str_at(rec, "body_excerpt") {
             details.push(("Notes", b.to_owned()));
         }
+        // A row created as a captain call is a question; any other kind is
+        // held work that resumes once answered.
+        let ask = decision
+            .then(|| self.hold_ask(&owner, str_at(rec, "kind") != Some("captain")))
+            .flatten();
         Some(Card {
             pr_number: pr_url.as_deref().and_then(pr_number),
             pr_url,
@@ -675,6 +730,7 @@ impl<'a> Builder<'a> {
             owner,
             column,
             decision,
+            ask,
             grill,
             paused: hold_kind.as_deref() == Some("parked"),
             blocked_by,
@@ -772,12 +828,24 @@ impl<'a> Builder<'a> {
         add("Filed", str_at(r, "since"));
         add("Hold", str_at(r, "hold_reason"));
         add("Notes", str_at(r, "body_excerpt"));
+        let mut questions = Vec::new();
         for d in arr_at(t, "hints.open_decisions") {
-            add(
-                "Open decision",
-                str_at(d, "summary").or_else(|| str_at(d, "key")),
-            );
+            let q = match (str_at(d, "summary"), str_at(d, "key")) {
+                (Some(s), Some(k)) if s != k => Some(format!("{s} [key={k}]")),
+                (Some(s), _) => Some(s.to_owned()),
+                (None, k) => k.map(str::to_owned),
+            };
+            add("Open decision", q.as_deref());
+            questions.extend(q);
         }
+        let held = bool_at(r, "captain_actionable");
+        let ask = if held {
+            self.hold_ask(&owner, true)
+        } else if pending {
+            Some(Ask::Worker { questions })
+        } else {
+            None
+        };
         Card {
             pr_number: pr_url.as_deref().and_then(pr_number),
             pr_url,
@@ -786,7 +854,8 @@ impl<'a> Builder<'a> {
             project,
             owner,
             column: Column::Building,
-            decision: pending || bool_at(r, "captain_actionable"),
+            decision: pending || held,
+            ask,
             grill: false,
             paused: false,
             blocked_by: strings_at(r, "unresolved_blocker_ids"),
@@ -915,6 +984,7 @@ impl<'a> Builder<'a> {
             owner,
             column,
             decision: false,
+            ask: None,
             grill: false,
             paused: false,
             blocked_by: Vec::new(),
@@ -1105,13 +1175,16 @@ impl<'a> Builder<'a> {
                     ));
                 }
             }
-            let child_decisions: HashMap<&str, &str> = arr_at(m, "decisions_open")
+            let child_decisions: HashMap<&str, Value> = arr_at(m, "decisions_open")
                 .iter()
                 .filter(|d| str_at(d, "source") == Some("status"))
                 .filter_map(|d| {
                     Some((
                         str_at(d, "id")?,
-                        str_at(d, "summary").unwrap_or("decision pending"),
+                        serde_json::json!({
+                            "key": str_at(d, "key"),
+                            "summary": str_at(d, "summary").unwrap_or("decision pending"),
+                        }),
                     ))
                 })
                 .collect();
@@ -1135,14 +1208,14 @@ impl<'a> Builder<'a> {
                         "state": str_at(child, "state").unwrap_or("working"),
                         "detail": str_at(child, "doing"),
                     },
-                    "hints": {"pending_decision": child_decisions.contains_key(id)},
+                    "hints": {
+                        "pending_decision": child_decisions.contains_key(id),
+                        "open_decisions": child_decisions.get(id).cloned().into_iter().collect::<Vec<_>>(),
+                    },
                     "backlog": {"title": str_at(child, "name")},
                 });
                 let mut c = self.building_card(id, Some(&task), None, owner.clone(), meta_path);
                 c.details.push(("Second mate", mate.to_owned()));
-                if let Some(d) = child_decisions.get(id) {
-                    c.details.push(("Open decision", (*d).to_owned()));
-                }
                 self.push(c);
             }
             let mut queued_ids = HashSet::new();

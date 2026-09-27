@@ -2,9 +2,10 @@
 //!
 //! Kanbr is one public tool that each user adapts through a small config file
 //! instead of a fork (decision 23): column labels, the branches that back Dev,
-//! Staging, and Live, and the words that mark grills and halted projects all
-//! live here with defaults matching the workflow Kanbr was designed for. The file is optional;
-//! its format is `key = value` lines with `#` comments.
+//! Staging, and Live, the words that mark grills and halted projects, and
+//! which requests prompt for a passphrase all live here with defaults matching
+//! the workflow Kanbr was designed for. The file is optional; its format is
+//! `key = value` lines with `#` comments. It never holds a passphrase.
 
 use std::env;
 use std::fs;
@@ -37,6 +38,11 @@ pub struct Config {
     pub staging_branch: String,
     /// The branch that backs Live; empty means no project uses Live.
     pub live_branch: String,
+    /// Release lanes whose requests prompt for that branch's passphrase: a
+    /// merge or promotion that lands on one of them.
+    pub passphrase_lanes: Vec<Column>,
+    /// Minutes a request waits for its outcome before the card snaps back.
+    pub request_timeout_mins: i64,
     /// Where the config was read from, if anywhere.
     pub source: Option<PathBuf>,
 }
@@ -54,6 +60,8 @@ impl Default for Config {
             dev_branch: "dev".to_owned(),
             staging_branch: "staging".to_owned(),
             live_branch: "main".to_owned(),
+            passphrase_lanes: vec![Column::Staging, Column::Live],
+            request_timeout_mins: 30,
             source: None,
         }
     }
@@ -123,6 +131,17 @@ impl Config {
                 "dev_branch" => cfg.dev_branch = value.to_owned(),
                 "staging_branch" => cfg.staging_branch = value.to_owned(),
                 "live_branch" => cfg.live_branch = value.to_owned(),
+                "passphrase_lanes" => {
+                    cfg.passphrase_lanes = lane_list(value)
+                        .ok_or_else(|| bad("must list lanes from dev, staging, live"))?
+                }
+                "request_timeout" => {
+                    cfg.request_timeout_mins = value
+                        .parse()
+                        .ok()
+                        .filter(|m: &i64| *m > 0)
+                        .ok_or_else(|| bad("must be a positive number of minutes"))?
+                }
                 _ => match LABEL_KEYS.iter().position(|k| *k == key) {
                     Some(i) if !value.is_empty() => cfg.labels[i] = value.to_owned(),
                     Some(_) => return Err(bad("must not be empty")),
@@ -156,6 +175,33 @@ impl Config {
     pub fn label(&self, column: Column) -> &str {
         &self.labels[column.index()]
     }
+
+    /// The branch that backs a release lane (empty when the lane is off).
+    pub fn branch(&self, column: Column) -> &str {
+        match column {
+            Column::Dev => &self.dev_branch,
+            Column::Staging => &self.staging_branch,
+            Column::Live => &self.live_branch,
+            _ => "",
+        }
+    }
+}
+
+/// `staging, live` as lanes; `None` for anything else.
+fn lane_list(value: &str) -> Option<Vec<Column>> {
+    let mut lanes = Vec::new();
+    for word in word_list(value) {
+        let lane = match word.as_str() {
+            "dev" => Column::Dev,
+            "staging" => Column::Staging,
+            "live" => Column::Live,
+            _ => return None,
+        };
+        if !lanes.contains(&lane) {
+            lanes.push(lane);
+        }
+    }
+    Some(lanes)
 }
 
 /// Config keys for the column labels, in board order.
@@ -314,6 +360,26 @@ mod tests {
         assert_eq!(cfg.label(Column::Ready), "Ready");
         assert_eq!(cfg.branches(), ["dev", "", "master"]);
         assert!(Config::parse("dev_label =", Path::new("c")).is_err());
+    }
+
+    #[test]
+    fn passphrase_lanes_and_request_timeout() {
+        let d = Config::default();
+        assert_eq!(d.passphrase_lanes, vec![Column::Staging, Column::Live]);
+        assert_eq!(d.request_timeout_mins, 30);
+        let cfg = Config::parse(
+            "passphrase_lanes = Live\nrequest_timeout = 5\n",
+            Path::new("c"),
+        )
+        .unwrap();
+        assert_eq!(cfg.passphrase_lanes, vec![Column::Live]);
+        assert_eq!(cfg.request_timeout_mins, 5);
+        let none = Config::parse("passphrase_lanes =", Path::new("c")).unwrap();
+        assert!(none.passphrase_lanes.is_empty());
+        assert!(Config::parse("passphrase_lanes = prod", Path::new("c")).is_err());
+        assert!(Config::parse("request_timeout = 0", Path::new("c")).is_err());
+        assert_eq!(d.branch(Column::Staging), "staging");
+        assert_eq!(d.branch(Column::Ready), "");
     }
 
     #[test]

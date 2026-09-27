@@ -579,6 +579,25 @@ fn main_worker_pending_decision_waits_on_captain_in_building() {
 }
 
 #[test]
+fn a_second_mate_call_is_answered_in_its_own_home_or_not_in_place() {
+    let b = fixture_board();
+    assert_eq!(
+        card(&b, "site-pricing-page").ask,
+        Some(Ask::Hold {
+            home: Some(PathBuf::from("/mates/alpha")),
+            work_item: true,
+        })
+    );
+
+    let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
+    snap["secondmate_current"]["records"][0]["home"] = Value::Null;
+    let b = board_from(&snap);
+    let c = card(&b, "site-pricing-page");
+    assert!(c.decision);
+    assert_eq!(c.ask, None);
+}
+
+#[test]
 fn merged_cards_sit_in_the_lane_their_change_reached() {
     let b = release_board();
     let c = card(&b, "shop-deploy-hook");

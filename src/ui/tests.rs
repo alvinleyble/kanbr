@@ -683,6 +683,45 @@ fn the_worker_pick_is_answered_in_place_while_the_request_stays_open() {
 }
 
 #[test]
+fn only_a_worker_request_can_be_answered_alongside() {
+    for (id, to, ask) in [
+        (
+            "site-launch-post",
+            Column::Ready,
+            Ask::Hold {
+                home: None,
+                work_item: false,
+            },
+        ),
+        (
+            "shop-force-update",
+            Column::Dev,
+            Ask::Worker {
+                questions: vec!["which retry limit?".into()],
+            },
+        ),
+    ] {
+        let mut a = release_app();
+        let mut board = a.board.clone().unwrap();
+        let card = board.cards.iter_mut().find(|c| c.id == id).unwrap();
+        card.decision = true;
+        card.ask = Some(ask);
+        if to == Column::Dev {
+            card.pr_url = Some("https://github.com/acme/shop/pull/160".into());
+        }
+        a.apply(Msg::Loaded(Box::new(Ok(board))));
+        a.request_move(id, to);
+        assert_eq!(a.modal, Modal::Confirm, "{id}");
+        press(&mut a, KeyCode::Enter);
+        a.jobs.clear();
+        assert!(a.select_card(id));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Modal::Details(_)), "{id}");
+        assert!(a.decide.is_none() && a.jobs.is_empty(), "{id}");
+    }
+}
+
+#[test]
 fn requests_time_out_and_replies_are_polled() {
     let mut a = release_app();
     assert!(a.select_card("site-launch-post"));

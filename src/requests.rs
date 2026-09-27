@@ -60,8 +60,8 @@ pub struct Pending {
     /// Firstmate replied `done:`; the board has not caught up yet.
     pub reported_done: bool,
     pub warning: Option<String>,
-    /// The request id of a decision answer sent while this move stays open,
-    /// until its outcome is back.
+    /// The request id of a model pick answered while this worker request
+    /// stays open, until its outcome is back.
     pub answering: Option<String>,
 }
 
@@ -80,6 +80,16 @@ impl Pending {
             warning: None,
             answering: None,
         }
+    }
+
+    fn is_worker_request(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Move {
+                action: Action::Worker,
+                ..
+            }
+        )
     }
 
     fn what(&self) -> String {
@@ -177,13 +187,21 @@ impl Tracker {
         self.pending.push(p);
     }
 
-    /// Starts an answer to `card_id`'s decision. A move still open for the
-    /// card stays open (the answer is its worker's model pick); the answer's
+    /// Whether `card_id`'s decision can be answered now: nothing is open for
+    /// the card, or only its worker request, whose model pick Firstmate puts
+    /// to the captain, with no answer already on its way.
+    pub fn can_answer(&self, card_id: &str) -> bool {
+        self.get(card_id)
+            .is_none_or(|p| p.is_worker_request() && p.answering.is_none())
+    }
+
+    /// Starts an answer to `card_id`'s decision. An open worker request for
+    /// the card stays open (the answer is its model pick); the answer's
     /// outcome then shows in the footer.
     pub fn start_answer(&mut self, card_id: &str, hold: bool, request_id: &str, now: i64) {
         match self.get_mut(card_id) {
-            Some(p) => p.answering = Some(request_id.to_owned()),
-            None => self.start(Pending::new(
+            Some(p) if p.is_worker_request() => p.answering = Some(request_id.to_owned()),
+            _ => self.start(Pending::new(
                 card_id,
                 Kind::Answer { hold },
                 request_id,

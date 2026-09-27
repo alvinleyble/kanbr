@@ -407,14 +407,7 @@ impl App {
         let Some(card) = self.selected_card() else {
             return;
         };
-        // A move stays open while its decision is answered (a worker's model
-        // pick); an answer already on its way blocks another.
-        let answerable = card.decision
-            && card.ask.is_some()
-            && self
-                .tracker
-                .get(&card.id)
-                .is_none_or(|p| matches!(p.kind, Kind::Move { .. }) && p.answering.is_none());
+        let answerable = card.decision && card.ask.is_some() && self.tracker.can_answer(&card.id);
         if !answerable {
             return self.open_details();
         }

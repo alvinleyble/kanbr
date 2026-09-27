@@ -119,7 +119,8 @@ strip, to jump from one to the next.
 
 1. the project and PR number (plus a `2nd` tag for a second mate's work);
 2. the title, after its badges: `⚑` decision, a test badge (reserved for Firstmate's
-   test results, which are not published yet), `grill`, and `⧗` dependency;
+   test results, which are not published yet), `grill`, `⧗` dependency, and `⇡`
+   promotion;
 3. the worker's model, elapsed time, and state.
 
 Press `Enter` (or double-click a card) for the details: hold reason, blockers,
@@ -198,8 +199,9 @@ that step. Kanbr first shows what it will ask, then sends it when you press `Ent
 A card moves one lane at a time, to the next lane its project uses: a project with
 no staging branch goes from Dev to Live (a main promotion), and one with only
 `main` merges from Building straight to Live (with the main passphrase). A
-promotion moves everything in the lane, and the confirmation lists it, with any
-database migrations going live. Backward drags are refused, since they would mean
+promotion moves everything in the lane, and the confirmation lists the changes it
+carries (not promotion tasks or finished work with no PR), with any database
+migrations going live. Backward drags are refused, since they would mean
 reverts; so are drags of a halted project's cards.
 
 ### Requested, moved, or snapped back

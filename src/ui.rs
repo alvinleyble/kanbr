@@ -1,8 +1,15 @@
 //! The interactive board: tabs, the waiting-on-you strip, six columns of
 //! compact cards with release headers over Staging and Live, a details view,
-//! release details, and copyable release notes. Read-only.
+//! release details, and copyable release notes.
+//!
+//! Acting from the board (slice 3): Enter on a card waiting on the captain
+//! opens its decision; dragging a card to the next column (or `m`) asks
+//! Firstmate for that move. Both are requests Firstmate carries out; the card
+//! shows "requested" until Firstmate's state shows the outcome (see
+//! [`crate::actions`] and [`crate::requests`]).
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -10,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -20,11 +27,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::actions::{self, AnswerJob, Job, Outcome, Plan, check_answer, next_column, request_id};
+use crate::config::Config;
 use crate::dates::now_epoch;
 use crate::firstmate::fingerprint;
 use crate::loader::Loader;
-use crate::model::{Board, Card, Column, Owner, TestBadge, Tone};
+use crate::model::{Ask, Board, Card, Column, Owner, TestBadge, Tone, assumed_lanes};
 use crate::notes::{column_header, details, release_notes};
+use crate::requests::{FLASH_SECS, Kind, Mark, Pending, Tracker};
+use crate::secret::Secret;
 
 const CARD_ROWS: u16 = 3;
 /// Rows above a column's cards: the title, the release line, and a rule.
@@ -35,6 +46,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(450);
 pub enum Msg {
     Loading,
     Loaded(Box<Result<Board, String>>),
+    /// What came of a request sent to Firstmate.
+    Action(Outcome),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +60,36 @@ pub enum Modal {
     Release,
     /// Plain-language release notes for the tab's Live release, to copy.
     Notes,
+    /// Answering a card's decision in place.
+    Decide(String),
+    /// Confirming a drag request, and typing its passphrase when it needs one.
+    Confirm,
+}
+
+/// A drag request waiting for the captain's confirmation.
+pub struct Confirm {
+    pub plan: Plan,
+    /// Typed into a masked prompt; never shown, stored, or logged.
+    pub passphrase: Secret,
+    pub error: Option<String>,
+}
+
+/// A decision being answered.
+pub struct Decide {
+    pub card_id: String,
+    pub input: String,
+    /// For a held task: lift the hold so the work resumes, instead of closing the call.
+    pub release: bool,
+    pub error: Option<String>,
+}
+
+/// A card being dragged with the mouse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Drag {
+    card_id: String,
+    from: usize,
+    over: usize,
+    moved: bool,
 }
 
 #[derive(Default)]
@@ -84,6 +127,16 @@ pub struct App {
     pub copy: Option<String>,
     /// The outcome of the last copy, shown in the notes view.
     pub flash: Option<String>,
+    pub config: Config,
+    /// Open requests and their outcomes.
+    pub tracker: Tracker,
+    /// Work for the thread that talks to Firstmate, taken by the run loop.
+    pub jobs: Vec<Job>,
+    pub confirm: Option<Confirm>,
+    pub decide: Option<Decide>,
+    drag: Option<Drag>,
+    /// `q` was pressed once while a request was still being sent.
+    quit_armed: bool,
 }
 
 impl App {
@@ -110,6 +163,13 @@ impl App {
             labels: Column::ALL.map(|c| c.title().to_owned()),
             copy: None,
             flash: None,
+            config: Config::default(),
+            tracker: Tracker::default(),
+            jobs: Vec::new(),
+            confirm: None,
+            decide: None,
+            drag: None,
+            quit_armed: false,
         }
     }
 
@@ -126,6 +186,12 @@ impl App {
         self.now.unwrap_or_else(now_epoch)
     }
 
+    /// Moves the test clock.
+    #[cfg(test)]
+    pub fn set_now(&mut self, now: i64) {
+        self.now = Some(now);
+    }
+
     pub fn apply(&mut self, msg: Msg) {
         match msg {
             Msg::Loading => self.loading = true,
@@ -133,6 +199,8 @@ impl App {
                 self.loading = false;
                 match *res {
                     Ok(board) => {
+                        let now = self.now();
+                        self.tracker.on_board(&board, now);
                         self.board = Some(board);
                         self.error = None;
                         self.loaded_at = Some(Instant::now());
@@ -141,6 +209,24 @@ impl App {
                     Err(e) => self.error = Some(e),
                 }
             }
+            Msg::Action(outcome) => {
+                let now = self.now();
+                // A recorded answer changes the backlog: read it back now.
+                self.force |= matches!(outcome, Outcome::Answered { .. });
+                self.tracker.on_outcome(outcome, now);
+            }
+        }
+    }
+
+    /// Times out requests that saw no outcome and schedules reads of
+    /// Firstmate's replies. Called by the run loop every turn.
+    pub fn tick(&mut self) {
+        let now = self.now();
+        self.tracker
+            .expire(now, self.config.request_timeout_mins.saturating_mul(60));
+        if self.tracker.wants_poll(now) {
+            self.tracker.polled(now);
+            self.jobs.push(Job::Poll);
         }
     }
 
@@ -220,6 +306,23 @@ impl App {
         {
             self.modal = Modal::None;
         }
+        // A decision that is no longer open (answered elsewhere) closes.
+        if let Modal::Decide(id) = &self.modal
+            && !self
+                .board
+                .as_ref()
+                .is_some_and(|b| b.cards.iter().any(|c| &c.id == id && c.decision))
+        {
+            let id = id.clone();
+            self.modal = Modal::None;
+            self.decide = None;
+            let now = self.now();
+            self.tracker.say(
+                format!("{id}: the decision closed before you answered"),
+                false,
+                now,
+            );
+        }
     }
 
     pub fn select_tab(&mut self, tab: usize) {
@@ -298,6 +401,251 @@ impl App {
         }
     }
 
+    /// Enter on a card: its decision when it waits on the captain and can be
+    /// answered in place, else its details.
+    fn open_selected(&mut self) {
+        let Some(card) = self.selected_card() else {
+            return;
+        };
+        let answerable =
+            card.decision && card.ask.is_some() && self.tracker.get(&card.id).is_none();
+        if !answerable {
+            return self.open_details();
+        }
+        let release = matches!(
+            card.ask,
+            Some(Ask::Hold {
+                work_item: true,
+                ..
+            })
+        );
+        let id = card.id.clone();
+        self.decide = Some(Decide {
+            card_id: id.clone(),
+            input: String::new(),
+            release,
+            error: None,
+        });
+        self.modal = Modal::Decide(id);
+        self.modal_scroll = 0;
+    }
+
+    fn lanes_of(&self, project: &str) -> crate::firstmate::Lanes {
+        self.board
+            .as_ref()
+            .and_then(|b| b.release(project))
+            .map_or_else(|| assumed_lanes(&self.config), |r| r.lanes)
+    }
+
+    /// `m`: asks to move the selected card to its next lane.
+    fn request_next(&mut self) {
+        let Some(card) = self.selected_card() else {
+            return;
+        };
+        let (id, column, project) = (card.id.clone(), card.column, card.project.clone());
+        match next_column(column, self.lanes_of(&project)) {
+            Some(to) => self.request_move(&id, to),
+            None => {
+                let now = self.now();
+                let reason = format!(
+                    "{} is the last lane {project} uses",
+                    self.labels[column.index()]
+                );
+                self.tracker.refuse(&id, &reason, now);
+            }
+        }
+    }
+
+    /// A drag (or `m`) of card `id` to column `to`: checks it and opens the
+    /// confirmation, or snaps the card back with the reason.
+    pub fn request_move(&mut self, id: &str, to: Column) {
+        let now = self.now();
+        let Some(board) = &self.board else { return };
+        let Some(card) = board.cards.iter().find(|c| c.id == id) else {
+            return;
+        };
+        if self.tracker.get(id).is_some() {
+            self.tracker.say(
+                format!("{id}: already requested; waiting for Firstmate"),
+                false,
+                now,
+            );
+            return;
+        }
+        match actions::plan(board, &self.config, card, to) {
+            Ok(plan) => {
+                self.confirm = Some(Confirm {
+                    plan,
+                    passphrase: Secret::new(),
+                    error: None,
+                });
+                self.modal = Modal::Confirm;
+                self.modal_scroll = 0;
+            }
+            Err(reason) => self.tracker.refuse(id, &reason, now),
+        }
+    }
+
+    fn cancel_input(&mut self) {
+        // Dropping the confirmation wipes a typed passphrase.
+        self.confirm = None;
+        self.decide = None;
+        self.modal = Modal::None;
+    }
+
+    fn send_confirm(&mut self) {
+        let Some(mut c) = self.confirm.take() else {
+            return;
+        };
+        if let Some(branch) = &c.plan.passphrase
+            && c.passphrase.is_empty()
+        {
+            c.error = Some(format!("type the {branch} passphrase first"));
+            self.confirm = Some(c);
+            return;
+        }
+        let now = self.now();
+        let Confirm {
+            plan, passphrase, ..
+        } = c;
+        let rid = request_id(plan.action.name(), &plan.card_id, now);
+        self.tracker.start(Pending::new(
+            &plan.card_id,
+            Kind::Move {
+                action: plan.action,
+                to: plan.to,
+                to_label: plan.to_label.clone(),
+            },
+            &rid,
+            now,
+        ));
+        let passphrase = plan.passphrase.is_some().then_some(passphrase);
+        self.jobs.push(Job::Request {
+            plan,
+            request_id: rid,
+            passphrase,
+        });
+        self.modal = Modal::None;
+    }
+
+    fn send_decide(&mut self) {
+        let Some(mut d) = self.decide.take() else {
+            return;
+        };
+        if let Err(e) = check_answer(&d.input) {
+            d.error = Some(e);
+            self.decide = Some(d);
+            return;
+        }
+        self.modal = Modal::None;
+        let now = self.now();
+        let Some(card) = self
+            .board
+            .as_ref()
+            .and_then(|b| b.cards.iter().find(|c| c.id == d.card_id))
+        else {
+            return;
+        };
+        let Some(ask) = card.ask.clone() else { return };
+        let rid = request_id("answer", &card.id, now);
+        let job = AnswerJob {
+            card_id: card.id.clone(),
+            title: card.title.clone(),
+            project: card.project.clone(),
+            owner: card.owner.clone(),
+            release: d.release && matches!(ask, Ask::Hold { .. }),
+            ask,
+            answer: d.input.trim().to_owned(),
+            request_id: rid.clone(),
+        };
+        self.tracker.start(Pending::new(
+            &job.card_id,
+            Kind::Answer {
+                hold: matches!(job.ask, Ask::Hold { .. }),
+            },
+            &rid,
+            now,
+        ));
+        self.jobs.push(Job::Answer(job));
+    }
+
+    fn confirm_key(&mut self, key: KeyEvent) {
+        let Some(c) = self.confirm.as_mut() else {
+            self.modal = Modal::None;
+            return;
+        };
+        let typing = c.plan.passphrase.is_some();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.cancel_input(),
+            KeyCode::Enter => self.send_confirm(),
+            KeyCode::Char('u') if ctrl && typing => c.passphrase = Secret::new(),
+            KeyCode::Backspace if typing => c.passphrase.pop(),
+            KeyCode::Char(ch) if typing && !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                c.passphrase.push(ch);
+                c.error = None;
+            }
+            KeyCode::Char('y') if !typing => self.send_confirm(),
+            KeyCode::Char('n' | 'q') if !typing => self.cancel_input(),
+            KeyCode::Up if !typing => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+            KeyCode::Down if !typing => self.modal_scroll = self.modal_scroll.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn decide_key(&mut self, key: KeyEvent) {
+        let Some(d) = self.decide.as_mut() else {
+            self.modal = Modal::None;
+            return;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.cancel_input(),
+            KeyCode::Enter => self.send_decide(),
+            KeyCode::Tab | KeyCode::BackTab => d.release = !d.release,
+            KeyCode::Char('u') if ctrl => d.input.clear(),
+            KeyCode::Backspace => {
+                d.input.pop();
+            }
+            KeyCode::Up => self.modal_scroll = self.modal_scroll.saturating_sub(1),
+            KeyCode::Down => self.modal_scroll = self.modal_scroll.saturating_add(1),
+            KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                if d.input.len() + ch.len_utf8() <= actions::ANSWER_LIMIT {
+                    d.input.push(ch);
+                }
+                d.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Pasted text goes into the open prompt, as one line.
+    pub fn handle_paste(&mut self, text: &str) {
+        let flat = text.replace(['\r', '\n', '\t'], " ");
+        match self.modal {
+            Modal::Confirm => {
+                if let Some(c) = self.confirm.as_mut()
+                    && c.plan.passphrase.is_some()
+                {
+                    c.passphrase.push_str(flat.trim());
+                    c.error = None;
+                }
+            }
+            Modal::Decide(_) => {
+                if let Some(d) = self.decide.as_mut() {
+                    for ch in flat.chars() {
+                        if d.input.len() + ch.len_utf8() > actions::ANSWER_LIMIT {
+                            break;
+                        }
+                        d.input.push(ch);
+                    }
+                    d.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_modal(&mut self, modal: Modal) {
         if self.board.is_some() {
             self.modal = modal;
@@ -322,8 +670,14 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cancel_input();
             self.quit = true;
             return;
+        }
+        match self.modal {
+            Modal::Confirm => return self.confirm_key(key),
+            Modal::Decide(_) => return self.decide_key(key),
+            _ => {}
         }
         if self.modal != Modal::None {
             if self.modal == Modal::Notes && key.code == KeyCode::Char('c') {
@@ -350,8 +704,24 @@ impl App {
             }
             return;
         }
+        if key.code != KeyCode::Char('q') {
+            self.quit_armed = false;
+        }
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if self.tracker.sending() && !self.quit_armed {
+                    self.quit_armed = true;
+                    let now = self.now();
+                    self.tracker.say(
+                        "a request is still being sent to Firstmate; press q again to quit anyway"
+                            .to_owned(),
+                        false,
+                        now,
+                    );
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Left | KeyCode::Char('h') => self.move_col(-1),
             KeyCode::Right | KeyCode::Char('l') => self.move_col(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
@@ -369,7 +739,9 @@ impl App {
                 let n = d.to_digit(10).unwrap_or(1) as usize;
                 self.select_tab(if n == 0 { 9 } else { n - 1 });
             }
-            KeyCode::Enter => self.open_details(),
+            KeyCode::Enter => self.open_selected(),
+            KeyCode::Char('d') => self.open_details(),
+            KeyCode::Char('m' | '>') => self.request_next(),
             KeyCode::Char('w') => self.jump_waiting(),
             KeyCode::Char('r') => self.force = true,
             KeyCode::Char('?') => self.modal = Modal::Help,
@@ -389,8 +761,36 @@ impl App {
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if matches!(self.modal, Modal::Confirm | Modal::Decide(_)) {
+            // A stray click must not throw away a typed answer or passphrase.
+            return;
+        }
         match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let over = self
+                    .hits
+                    .columns
+                    .iter()
+                    .find(|(r, _)| r.contains(pos))
+                    .map(|&(_, c)| c);
+                if let Some(d) = self.drag.as_mut() {
+                    d.moved = true;
+                    if let Some(c) = over {
+                        d.over = c;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(d) = self.drag.take()
+                    && d.moved
+                    && d.over != d.from
+                {
+                    self.last_click = None;
+                    self.request_move(&d.card_id, Column::ALL[d.over]);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = None;
                 if self.modal != Modal::None {
                     self.modal = Modal::None;
                     return;
@@ -415,13 +815,20 @@ impl App {
                     self.sel[col] = idx;
                     self.remember(col);
                     let id = self.sel_id[col].clone().unwrap_or_default();
+                    self.drag = Some(Drag {
+                        card_id: id.clone(),
+                        from: col,
+                        over: col,
+                        moved: false,
+                    });
                     let double = self
                         .last_click
                         .as_ref()
                         .is_some_and(|(at, last)| *last == id && at.elapsed() < DOUBLE_CLICK);
                     if double {
                         self.last_click = None;
-                        self.open_details();
+                        self.drag = None;
+                        self.open_selected();
                     } else {
                         self.last_click = Some((Instant::now(), id));
                     }
@@ -511,8 +918,15 @@ fn tone_color(tone: Tone) -> Color {
 const DIM: Style = Style::new().fg(Color::DarkGray);
 const SELECTED_BG: Color = Color::Indexed(237);
 
-/// The three lines of a compact card, fitted to `width` cells.
-pub fn card_lines(card: &Card, width: usize, selected: bool, now: i64) -> Vec<Line<'static>> {
+/// The three lines of a compact card, fitted to `width` cells. A request
+/// `mark` replaces the state on the third line.
+pub fn card_lines(
+    card: &Card,
+    width: usize,
+    selected: bool,
+    now: i64,
+    mark: Option<&Mark>,
+) -> Vec<Line<'static>> {
     let greyed = card.paused;
     let plain = card.outside;
     let fg = |c: Color| {
@@ -624,10 +1038,23 @@ pub fn card_lines(card: &Card, width: usize, selected: bool, now: i64) -> Vec<Li
         parts.push(Span::styled(" · ", DIM));
     }
     let lead: usize = parts.iter().map(|s| text_width(&s.content)).sum();
-    let state = truncate(&card.state, inner.saturating_sub(lead));
+    let (state, state_style) = match mark {
+        Some(Mark::Open(t)) => (t.as_str(), Style::new().fg(Color::Cyan)),
+        Some(Mark::Failed(t)) => (t.as_str(), Style::new().fg(Color::Red)),
+        Some(Mark::Done(t)) => (t.as_str(), Style::new().fg(Color::Green)),
+        None => (
+            card.state.as_str(),
+            Style::new().fg(fg(tone_color(card.tone))),
+        ),
+    };
+    if mark.is_some() {
+        // The request is what matters now: drop the model and age first.
+        parts.clear();
+    }
+    let lead = if mark.is_some() { 0 } else { lead };
     parts.push(Span::styled(
-        state,
-        Style::new().fg(fg(tone_color(card.tone))),
+        truncate(state, inner.saturating_sub(lead)),
+        state_style,
     ));
     let mut l3 = vec![marker()];
     let mut w = 0;
@@ -718,6 +1145,8 @@ pub fn render(app: &mut App, f: &mut Frame) {
         Modal::Notices => render_notices(app, f, area),
         Modal::Release => render_release(app, f, area),
         Modal::Notes => render_notes(app, f, area),
+        Modal::Decide(id) => render_decide(app, f, area, &id),
+        Modal::Confirm => render_confirm(app, f, area),
     }
 }
 
@@ -838,7 +1267,16 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
         let cards: Vec<Card> = app.column_cards(ci).into_iter().cloned().collect();
         let focused = ci == app.col;
         let title = app.labels[ci].clone();
-        let header_style = if focused {
+        let drop_target = app
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.moved && d.over == ci && d.over != d.from);
+        let header_style = if drop_target {
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if focused {
             Style::new()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -912,7 +1350,14 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
             let h = CARD_ROWS.min(list.y + list.height - y);
             let r = Rect::new(list.x, y, list.width, h);
             let selected = focused && idx == sel;
-            let lines = card_lines(&cards[idx], list.width as usize, selected, now);
+            let mark = app.tracker.mark(&cards[idx].id);
+            let lines = card_lines(
+                &cards[idx],
+                list.width as usize,
+                selected,
+                now,
+                mark.as_ref(),
+            );
             f.render_widget(Paragraph::new(lines), r);
             app.hits.cards.push((r, ci, idx));
         }
@@ -935,7 +1380,34 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
 }
 
 fn render_footer(app: &App, f: &mut Frame, area: Rect) {
-    let keys = " ←→ column  ↑↓ card  enter details  w waiting  1-9 tab  i release  R notes  r refresh  ? help  q quit";
+    let now = app.now();
+    let dragging = app.drag.as_ref().filter(|d| d.moved);
+    let flash = app
+        .tracker
+        .flash
+        .as_ref()
+        .filter(|(_, _, at)| now - at < FLASH_SECS);
+    let (keys, keys_style) = if let Some(d) = dragging {
+        let text = if d.over == d.from {
+            " drag to the next column and release to ask Firstmate for the move".to_owned()
+        } else {
+            format!(
+                " release to ask Firstmate to move it to {}",
+                app.labels[d.over]
+            )
+        };
+        (text, Style::new().fg(Color::Cyan))
+    } else if let Some((text, ok, _)) = flash {
+        (
+            format!(" {text}"),
+            Style::new().fg(if *ok { Color::Green } else { Color::Red }),
+        )
+    } else {
+        (
+            " ←→ column  ↑↓ card  enter details/answer  m move  w waiting  1-9 tab  i release  R notes  r refresh  ? help  q quit".to_owned(),
+            DIM,
+        )
+    };
     let status = if app.loading {
         "refreshing…".to_owned()
     } else if let Some(t) = app.loaded_at {
@@ -945,11 +1417,11 @@ fn render_footer(app: &App, f: &mut Frame, area: Rect) {
     };
     let status = format!("{status} ");
     let room = (area.width as usize).saturating_sub(text_width(&status) + 1);
-    let keys = truncate(keys, room);
+    let keys = truncate(&keys, room);
     let gap = (area.width as usize).saturating_sub(text_width(&keys) + text_width(&status));
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(keys, DIM),
+            Span::styled(keys, keys_style),
             Span::raw(" ".repeat(gap)),
             Span::styled(status, DIM),
         ])),
@@ -1020,6 +1492,9 @@ fn render_details(app: &App, f: &mut Frame, area: Rect, id: &str) {
     for (k, v) in &card.details {
         row(k, v.clone());
     }
+    for (k, v) in app.tracker.detail_rows(&card.id, now) {
+        row(k, v);
+    }
     let r = centered(area, 80, 80, 40, 10);
     f.render_widget(Clear, r);
     f.render_widget(
@@ -1037,7 +1512,15 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("↑ ↓ / j k", "move between cards"),
         ("pgup pgdn", "move five cards"),
         ("g G / home end", "first or last card"),
-        ("enter / double-click", "card details"),
+        (
+            "enter / double-click",
+            "answer a ⚑ decision in place, else card details",
+        ),
+        ("d", "card details"),
+        (
+            "drag / m / >",
+            "ask Firstmate to move the card to the next column",
+        ),
         ("1-9, 0 / tab / click", "switch project tab (1 is All)"),
         (
             "w / click the strip",
@@ -1054,7 +1537,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     ];
     let mut lines = vec![
         Line::styled(
-            "Kanbr is read-only: it shows Firstmate's work, it never changes it.",
+            "Kanbr never changes Firstmate itself: an answer or a drag is a request Firstmate carries out through its own guarded scripts. The card shows \"requested\" and moves only when that succeeds; otherwise it snaps back with the reason.",
             DIM,
         ),
         Line::raw(""),
@@ -1084,7 +1567,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         "Dev, Staging, and Live come from git: each change sits in the furthest branch it has reached, and Live shows only the latest release. The board reads each clone as of its last fetch.",
         DIM,
     ));
-    let r = centered(area, 70, 75, 50, 24);
+    let r = centered(area, 70, 80, 50, 28);
     f.render_widget(Clear, r);
     f.render_widget(
         Paragraph::new(lines)
@@ -1178,6 +1661,246 @@ fn render_notes(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(
         Paragraph::new(lines)
             .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+fn render_confirm(app: &App, f: &mut Frame, area: Rect) {
+    let Some(c) = &app.confirm else { return };
+    let p = &c.plan;
+    let label = Style::new().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::styled(
+            format!("Ask Firstmate to {}", p.headline()),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let mut row = |k: &str, v: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{k:<11} "), label),
+            Span::raw(v),
+        ]));
+    };
+    row("Card", format!("{} · {}", p.card_id, p.title));
+    row("Move", format!("{} → {}", p.from_label, p.to_label));
+    if let Owner::Secondmate(m) = &p.owner {
+        row("Owner", format!("second mate {m}"));
+    }
+    if !p.blocked_by.is_empty() {
+        row("Waits for", p.blocked_by.join(", "));
+    }
+    match p.action {
+        actions::Action::Ready => row(
+            "Asks",
+            "mark it talked through and ready: Firstmate lifts its hold".to_owned(),
+        ),
+        actions::Action::Worker => row(
+            "Asks",
+            "a worker: Firstmate recommends two models and puts the pick to you as a decision on this card".to_owned(),
+        ),
+        actions::Action::Merge => {
+            row("PR", p.pr_url.clone().unwrap_or_default());
+            row(
+                "Asks",
+                "your merge word for this PR. Kanbr reads its checks first and sends the word only when every check is green".to_owned(),
+            );
+        }
+        actions::Action::Promote => {
+            row(
+                "Branches",
+                format!(
+                    "{} → {}",
+                    p.source_branch.as_deref().unwrap_or("?"),
+                    p.branch.as_deref().unwrap_or("?")
+                ),
+            );
+            row(
+                "Moves",
+                format!(
+                    "{} change(s): the promotion takes everything in {}",
+                    p.moves.len(),
+                    p.from_label
+                ),
+            );
+            for m in p.moves.iter().take(8) {
+                row("", format!("· {m}"));
+            }
+            if p.moves.len() > 8 {
+                row("", format!("… and {} more", p.moves.len() - 8));
+            }
+            if !p.migrations.is_empty() {
+                row(
+                    "Migrations",
+                    format!(
+                        "{} database migration(s) go live with it: {}",
+                        p.migrations.len(),
+                        p.migrations.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Firstmate does the real work through its guarded scripts. The card shows \"requested\" and moves only when that succeeds; otherwise it snaps back with the reason.",
+        DIM,
+    ));
+    if let Some(branch) = &p.passphrase {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{branch} passphrase: "),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "•".repeat(c.passphrase.chars().min(64)),
+                Style::new().fg(Color::White),
+            ),
+            Span::styled("█", DIM),
+        ]));
+        lines.push(Line::styled(
+            "Masked. It travels only inside this one request to Firstmate; Kanbr never stores, logs, or shows it.",
+            DIM,
+        ));
+    }
+    if let Some(e) = &c.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(e.clone(), Style::new().fg(Color::Red)));
+    }
+    let title = if p.passphrase.is_some() {
+        " Request · type the passphrase · enter to send · esc to cancel "
+    } else {
+        " Request · enter to send · esc to cancel "
+    };
+    let r = centered(area, 80, 70, 40, 14);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(title.to_owned()))
+            .wrap(Wrap { trim: false })
+            .scroll((app.modal_scroll, 0)),
+        r,
+    );
+}
+
+fn render_decide(app: &App, f: &mut Frame, area: Rect, id: &str) {
+    let (Some(d), Some(card)) = (
+        &app.decide,
+        app.board
+            .as_ref()
+            .and_then(|b| b.cards.iter().find(|c| c.id == id)),
+    ) else {
+        return;
+    };
+    let label = Style::new().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::styled(
+            card.title.clone(),
+            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    let mut row = |k: &str, v: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{k:<11} "), label),
+            Span::raw(v),
+        ]));
+    };
+    row("Project", card.project.clone());
+    if let Owner::Secondmate(m) = &card.owner {
+        row("Owner", format!("second mate {m}"));
+    }
+    let detail = |key: &str| {
+        card.details
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    };
+    let hold = matches!(card.ask, Some(Ask::Hold { .. }));
+    match &card.ask {
+        Some(Ask::Hold { .. }) => {
+            row(
+                "Question",
+                detail("Hold").unwrap_or_else(|| "held for your call".to_owned()),
+            );
+        }
+        Some(Ask::Worker { questions }) if !questions.is_empty() => {
+            for q in questions {
+                row("Question", q.clone());
+            }
+        }
+        _ => row(
+            "Question",
+            "the worker is waiting on your decision".to_owned(),
+        ),
+    }
+    if let Some(n) = detail("Notes") {
+        row("Notes", n);
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Your answer, in your own words:",
+        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::from(vec![
+        Span::styled("> ", label),
+        Span::raw(d.input.clone()),
+        Span::styled("█", DIM),
+    ]));
+    lines.push(Line::raw(""));
+    let dot = |on: bool| if on { "● " } else { "○ " };
+    if hold {
+        lines.push(Line::from(vec![
+            Span::styled("Tab        ", label),
+            Span::styled(
+                format!("{}resume the work (release)", dot(d.release)),
+                if d.release {
+                    Style::new().fg(Color::White)
+                } else {
+                    DIM
+                },
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("{}close the call (done)", dot(!d.release)),
+                if d.release {
+                    DIM
+                } else {
+                    Style::new().fg(Color::White)
+                },
+            ),
+        ]));
+        let home = match &card.ask {
+            Some(Ask::Hold { home: Some(h), .. }) => h.display().to_string(),
+            _ => app.home_label.clone(),
+        };
+        lines.push(Line::styled(
+            format!(
+                "Goes to Firstmate's keyed-answer intake (bin/fm-captain-hold.sh answers) in {home}, and Firstmate is woken to act on it."
+            ),
+            DIM,
+        ));
+    } else {
+        lines.push(Line::styled(
+            "Goes to Firstmate as a request note; Firstmate relays it to the worker, and the badge clears when the worker's decision is resolved.",
+            DIM,
+        ));
+    }
+    if let Some(e) = &d.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(e.clone(), Style::new().fg(Color::Red)));
+    }
+    let r = centered(area, 80, 70, 40, 14);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(modal_block(format!(
+                " ⚑ {} · enter to send · esc to cancel ",
+                card.id
+            )))
             .wrap(Wrap { trim: false })
             .scroll((app.modal_scroll, 0)),
         r,
@@ -1290,28 +2013,51 @@ fn spawn_refresher(loader: Loader, tx: Sender<Msg>, force: Receiver<()>) {
     });
 }
 
+/// The thread that talks to Firstmate: sends requests and answers, reads
+/// replies, and reports each outcome back to the board.
+fn spawn_actions(home: PathBuf, tx: Sender<Msg>) -> Sender<Job> {
+    let (job_tx, job_rx) = mpsc::channel::<Job>();
+    thread::spawn(move || {
+        let transport = actions::Firstmate { home };
+        for job in job_rx {
+            let outcome = actions::run_job(&transport, job);
+            if tx.send(Msg::Action(outcome)).is_err() {
+                return;
+            }
+        }
+    });
+    job_tx
+}
+
 pub fn run(loader: Loader) -> io::Result<()> {
     let home_label = loader.home.display().to_string();
     let labels = loader.config.labels.clone();
+    let config = loader.config.clone();
     let (tx, rx) = mpsc::channel();
     let (force_tx, force_rx) = mpsc::channel();
+    let jobs = spawn_actions(loader.home.clone(), tx.clone());
     spawn_refresher(loader, tx, force_rx);
 
     let mut terminal = ratatui::init();
-    execute!(io::stdout(), EnableMouseCapture)?;
+    execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let restore_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
         restore_hook(info);
     }));
 
     let mut app = App::new(home_label);
     app.labels = labels;
+    app.config = config;
     let mut mouse = true;
     let result = (|| -> io::Result<()> {
         loop {
             while let Ok(msg) = rx.try_recv() {
                 app.apply(msg);
+            }
+            app.tick();
+            for job in app.jobs.drain(..) {
+                let _ = jobs.send(job);
             }
             if app.wants_mouse() != mouse {
                 mouse = app.wants_mouse();
@@ -1329,6 +2075,7 @@ pub fn run(loader: Loader) -> io::Result<()> {
                 match event::read()? {
                     Event::Key(k) => app.handle_key(k),
                     Event::Mouse(m) => app.handle_mouse(m),
+                    Event::Paste(text) => app.handle_paste(&text),
                     _ => {}
                 }
             }
@@ -1340,7 +2087,7 @@ pub fn run(loader: Loader) -> io::Result<()> {
             }
         }
     })();
-    let _ = execute!(io::stdout(), DisableMouseCapture);
+    let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }

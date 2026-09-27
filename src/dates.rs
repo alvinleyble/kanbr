@@ -43,6 +43,17 @@ pub fn format_date(epoch: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `2026-09-27 01:23 UTC`: an exact moment for a request record.
+pub fn format_utc(epoch: i64) -> String {
+    let (y, m, d) = civil(epoch);
+    let secs = epoch.rem_euclid(DAY);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];

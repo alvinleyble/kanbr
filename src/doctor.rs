@@ -1,6 +1,7 @@
-//! `kanbr doctor`: verifies every Firstmate surface Kanbr reads, so a
-//! Firstmate update that breaks one fails loudly here instead of showing a
-//! silently empty board.
+//! `kanbr doctor`: verifies every Firstmate surface Kanbr reads or writes, so
+//! a Firstmate update that breaks one fails loudly here instead of showing a
+//! silently empty board or losing a request. Every probe is read-only: it
+//! never saves a note or feeds the answer intake.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -9,11 +10,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::actions::parse_receipts;
 use crate::config::{Config, resolve_home};
 use crate::dates::{DAY, format_ago, format_day, now_epoch};
 use crate::firstmate::{
-    PROJECTS_REGISTRY, SNAPSHOT_SCHEMA, SNAPSHOT_SCRIPT, SNAPSHOT_TIMEOUT, SURFACES, read_meta,
-    read_projects_registry, run_bounded, run_snapshot,
+    HOLD_SCRIPT, INBOX_SCRIPT, PROJECTS_REGISTRY, SNAPSHOT_SCHEMA, SNAPSHOT_SCRIPT,
+    SNAPSHOT_TIMEOUT, SURFACES, last_line, read_meta, read_projects_registry, run_bounded,
+    run_snapshot,
 };
 use crate::forge::{self, GhError};
 use crate::json::{arr_at, get, str_at};
@@ -290,6 +293,188 @@ fn git_available() -> bool {
     matches!(run_bounded(cmd, Duration::from_secs(5)), Ok((Some(s), _, _)) if s.success())
 }
 
+/// Runs a read-only Firstmate script (help, receipts, readiness) in `home`.
+fn probe(home: &Path, rel: &str, args: &[&str]) -> Result<String, String> {
+    let path = home.join(rel);
+    if !is_executable(&path) {
+        return Err(format!("{} is missing or not executable", path.display()));
+    }
+    let mut cmd = Command::new(&path);
+    cmd.args(args)
+        .current_dir(home)
+        .env("FM_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match run_bounded(cmd, Duration::from_secs(30)) {
+        Ok((Some(s), out, _)) if s.success() => Ok(out),
+        Ok((Some(_), out, err)) => {
+            let text = if err.trim().is_empty() { out } else { err };
+            Err(format!(
+                "{rel} {} failed: {}",
+                args.join(" "),
+                last_line(text.trim())
+            ))
+        }
+        Ok((None, _, _)) => Err(format!("{rel} {} did not finish in 30s", args.join(" "))),
+        Err(e) => Err(format!("cannot run {rel}: {e}")),
+    }
+}
+
+/// The surfaces Kanbr acts through: the captain inbox that carries drag
+/// requests and replies, whether Firstmate is running to take them, and the
+/// keyed-answer intake of the board's home and each second mate's.
+pub fn action_checks(home: &Path, snap: &Value) -> Vec<Check> {
+    let mut out = Vec::new();
+    out.push(match probe(home, INBOX_SCRIPT, &["--help"]) {
+        Ok(help) => {
+            let missing: Vec<&str> = [
+                ("note --request-id", "note [--request-id <id>]"),
+                ("note --json", "[--json]"),
+                ("note - (body on stdin)", "-   (body from stdin)"),
+                ("reply", "reply [--json] <id>"),
+                ("receipts", "receipts"),
+            ]
+            .into_iter()
+            .filter(|(_, needle)| !help.contains(needle))
+            .map(|(name, _)| name)
+            .collect();
+            if missing.is_empty() {
+                check(
+                    Level::Ok,
+                    "inbox requests",
+                    format!(
+                        "{INBOX_SCRIPT} takes note --request-id --json with the body on stdin, reply, and receipts: drags and worker answers can be requested"
+                    ),
+                )
+            } else {
+                check(
+                    Level::Fail,
+                    "inbox requests",
+                    format!(
+                        "{INBOX_SCRIPT} lacks {}: Kanbr cannot send drag requests",
+                        missing.join(", ")
+                    ),
+                )
+            }
+        }
+        Err(e) => check(
+            Level::Fail,
+            "inbox requests",
+            format!("{e}: Kanbr cannot send drag requests"),
+        ),
+    });
+    out.push(
+        match probe(home, INBOX_SCRIPT, &["receipts"]).and_then(|o| parse_receipts(&o)) {
+            Ok(r) => {
+                let handled = r.iter().filter(|n| n.acknowledged).count();
+                check(
+                    Level::Ok,
+                    "inbox receipts",
+                    format!(
+                        "{INBOX_SCRIPT} receipts reads {} pending and {handled} handled note(s): Firstmate's replies to requests read back",
+                        r.len() - handled
+                    ),
+                )
+            }
+            Err(e) => check(
+                Level::Fail,
+                "inbox receipts",
+                format!("{e}: a request's outcome could only come from the board or a timeout"),
+            ),
+        },
+    );
+    out.push(match probe(home, INBOX_SCRIPT, &["ready"]) {
+        Ok(o) => match serde_json::from_str::<Value>(o.trim()) {
+            Ok(v) if str_at(&v, "schema") == Some("fm-primary-ready.v1") => {
+                let consumer = format!(
+                    "wake consumer {}{}",
+                    str_at(&v, "wake_consumer.state").unwrap_or("unknown"),
+                    str_at(&v, "wake_consumer.reason")
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                );
+                if get(&v, "can_receive").as_bool() == Some(true) {
+                    check(
+                        Level::Ok,
+                        "firstmate ready",
+                        format!("Firstmate is running and receives requests; {consumer}"),
+                    )
+                } else {
+                    check(
+                        Level::Warn,
+                        "firstmate ready",
+                        format!(
+                            "requests are saved but wait until Firstmate runs: session lock {}, {consumer}",
+                            str_at(&v, "lock.state").unwrap_or("unknown")
+                        ),
+                    )
+                }
+            }
+            _ => check(
+                Level::Warn,
+                "firstmate ready",
+                format!("{INBOX_SCRIPT} ready printed no fm-primary-ready.v1 record"),
+            ),
+        },
+        Err(e) => check(
+            Level::Warn,
+            "firstmate ready",
+            format!("{e}; whether Firstmate is running to take requests is unknown"),
+        ),
+    });
+    out.push(match probe(home, HOLD_SCRIPT, &["--help"]) {
+        Ok(help) if help.contains("answers") && help.contains("--source") => check(
+            Level::Ok,
+            "answer intake",
+            format!(
+                "{HOLD_SCRIPT} answers --source takes keyed answers: decisions can be answered in place"
+            ),
+        ),
+        Ok(_) => check(
+            Level::Fail,
+            "answer intake",
+            format!("{HOLD_SCRIPT} has no `answers --source` intake: decisions cannot be answered in place"),
+        ),
+        Err(e) => check(
+            Level::Fail,
+            "answer intake",
+            format!("{e}: decisions cannot be answered in place"),
+        ),
+    });
+    let mates: Vec<(&str, PathBuf)> = arr_at(snap, "secondmate_current.records")
+        .iter()
+        .filter_map(|m| Some((str_at(m, "id")?, PathBuf::from(str_at(m, "home")?))))
+        .collect();
+    if !mates.is_empty() {
+        let missing: Vec<&str> = mates
+            .iter()
+            .filter(|(_, h)| !is_executable(&h.join(HOLD_SCRIPT)))
+            .map(|(id, _)| *id)
+            .collect();
+        out.push(if missing.is_empty() {
+            check(
+                Level::Ok,
+                "mate intakes",
+                format!(
+                    "{} second mate home(s) have {HOLD_SCRIPT}: their calls can be answered in place",
+                    mates.len()
+                ),
+            )
+        } else {
+            check(
+                Level::Warn,
+                "mate intakes",
+                format!(
+                    "no {HOLD_SCRIPT} to run for {}: answer their calls from chat",
+                    missing.join(", ")
+                ),
+            )
+        });
+    }
+    out
+}
+
 /// One project's release reading: the refs behind its lanes, its latest
 /// release, database changes waiting in Staging, and how fresh the clone is.
 /// A stale clone only warns for a project on the board (`shown`).
@@ -431,6 +616,7 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
         }
     };
     out.extend(contract_checks(&snap));
+    out.extend(action_checks(&home, &snap));
 
     let metas: Vec<PathBuf> = arr_at(&snap, "tasks")
         .iter()
@@ -541,14 +727,14 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
             Level::Ok,
             "gh",
             format!(
-                "{s}; asked only about a merged PR whose merge message has no PR number, and the promotion PR behind a fast-forward release"
+                "{s}; asked about a merged PR whose merge message has no PR number, the promotion PR behind a fast-forward release, and a PR's checks before a merge request"
             ),
         ),
         Err(e) => check(
             Level::Warn,
             "gh",
             format!(
-                "{}: a merged PR whose merge message has no PR number (a rebase merge or an edited message) is placed by its merge date, and a fast-forward release starts where the reflog last saw the Live branch",
+                "{}: a merged PR whose merge message has no PR number (a rebase merge or an edited message) is placed by its merge date, a fast-forward release starts where the reflog last saw the Live branch, and a drag to merge is refused because its checks cannot be confirmed green",
                 match e {
                     GhError::Missing => "not installed".to_owned(),
                     GhError::Failed(why) => format!("not usable ({why})"),
@@ -601,9 +787,10 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
 
 /// Formats the report and returns it with the process exit code.
 pub fn report(checks: &[Check]) -> (String, i32) {
-    let mut s = String::from("kanbr doctor: checking every Firstmate surface Kanbr reads\n");
-    for (surface, why) in SURFACES {
-        let _ = writeln!(s, "  reads {surface}: {why}");
+    let mut s =
+        String::from("kanbr doctor: checking every Firstmate surface Kanbr reads or writes\n");
+    for (verb, surface, why) in SURFACES {
+        let _ = writeln!(s, "  {verb} {surface}: {why}");
     }
     s.push('\n');
     for c in checks {

@@ -1,4 +1,4 @@
-//! Read-only access to the Firstmate surfaces Kanbr depends on.
+//! Access to the Firstmate surfaces Kanbr depends on.
 //!
 //! The primary surface is Firstmate's canonical fleet snapshot,
 //! `bin/fm-fleet-snapshot.sh --json` (schema `fm-fleet-snapshot.v1`), the same
@@ -14,8 +14,13 @@
 //!   merged work in Dev, Staging, or Live and describe releases;
 //! - optionally `gh pr view`, for a merged PR its history does not name.
 //!
+//! Acting from the board (see [`crate::actions`]) goes only through
+//! Firstmate's own guarded entry points: the captain inbox
+//! (`bin/fm-inbox.sh note`, `receipts`) and the keyed-answer intake
+//! (`bin/fm-captain-hold.sh answers`).
+//!
 //! Every surface is listed in [`SURFACES`] and verified by `kanbr doctor`.
-//! Kanbr never writes to a Firstmate file or a project repository.
+//! Kanbr never writes a Firstmate file or a project repository itself.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -36,24 +41,47 @@ pub const SNAPSHOT_SCHEMA: &str = "fm-fleet-snapshot.v1";
 pub const PROJECTS_REGISTRY: &str = "data/projects.md";
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Every Firstmate surface Kanbr reads, for documentation and `kanbr doctor`.
-pub const SURFACES: &[(&str, &str)] = &[
+pub const INBOX_SCRIPT: &str = "bin/fm-inbox.sh";
+pub const HOLD_SCRIPT: &str = "bin/fm-captain-hold.sh";
+
+/// Every Firstmate surface Kanbr reads or writes, for documentation and
+/// `kanbr doctor`: `(verb, surface, why)`.
+pub const SURFACES: &[(&str, &str, &str)] = &[
     (
+        "reads",
         "bin/fm-fleet-snapshot.sh --json",
         "canonical fleet snapshot (fm-fleet-snapshot.v1): backlog, workers, second mates",
     ),
     (
+        "reads",
         "state/<id>.meta",
         "worker model and effort (not in any snapshot)",
     ),
-    ("data/projects.md", "registered project names"),
+    ("reads", "data/projects.md", "registered project names"),
     (
+        "reads",
         "projects/<name> git history",
         "Dev, Staging, Live branches; how far each merged change has reached; releases (read-only, as of the last fetch)",
     ),
     (
+        "reads",
         "gh pr view (optional)",
-        "the commit a merged PR landed as, when its merge message has no PR number",
+        "the commit a merged PR landed as, when its merge message has no PR number; a PR's checks before a merge request",
+    ),
+    (
+        "writes",
+        "bin/fm-inbox.sh note --request-id --json",
+        "each drag request, worker answer, and answer wake-up as a durable captain inbox note that wakes Firstmate",
+    ),
+    (
+        "reads",
+        "bin/fm-inbox.sh receipts, ready",
+        "whether Firstmate picked a request up and its reply; whether Firstmate is running to receive requests",
+    ),
+    (
+        "writes",
+        "bin/fm-captain-hold.sh answers",
+        "a decision answer through Firstmate's keyed-answer intake, in the home that owns the task",
     ),
 ];
 
@@ -116,7 +144,7 @@ pub fn run_snapshot(home: &Path, timeout: Duration) -> Result<Value, String> {
     }
 }
 
-fn last_line(text: &str) -> &str {
+pub fn last_line(text: &str) -> &str {
     text.lines()
         .rev()
         .find(|l| !l.trim().is_empty())
@@ -146,6 +174,57 @@ pub fn run_bounded(
         }
         s
     });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok((status, stdout, stderr))
+}
+
+/// Runs a command with `input` on its stdin (never in its arguments, so it
+/// does not show in the process list), killing it after `timeout`.
+pub fn run_bounded_input(
+    mut cmd: Command,
+    input: &[u8],
+    timeout: Duration,
+) -> std::io::Result<(Option<std::process::ExitStatus>, String, String)> {
+    use std::io::Write;
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stdin = child.stdin.take();
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let out_reader = thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(o) = out.as_mut() {
+            let _ = o.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_reader = thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(e) = err.as_mut() {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    // Input is small (one request); a child that exits without reading it
+    // only makes this write fail, which its exit status then explains.
+    if let Some(mut i) = stdin.take() {
+        let _ = i.write_all(input);
+    }
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait()? {

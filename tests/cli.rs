@@ -7,6 +7,33 @@ use std::process::{Command, Output};
 
 const FIXTURE: &str = include_str!("fixtures/snapshot.json");
 
+/// A captain inbox that answers only the read-only probes; any request it is
+/// sent leaves a file behind, so a test can prove none was.
+const INBOX: &str = r#"#!/bin/sh
+case "$1" in
+  --help) printf 'Usage:\n  fm-inbox.sh note [--request-id <id>] [--json] [--] <text>...\n  fm-inbox.sh note [--request-id <id>] [--json] -   (body from stdin)\n  fm-inbox.sh reply [--json] <id> <text>...\n  fm-inbox.sh receipts [--after <cursor>]\n  fm-inbox.sh ready\n' ;;
+  receipts) printf '{"schema":"fm-inbox-receipts.v1","pending":[],"handled":[{"id":"n1","reply":null}],"replies":[]}\n' ;;
+  ready) printf '{"schema":"fm-primary-ready.v1","lock":{"state":"held"},"wake_consumer":{"state":"healthy","reason":"supervised"},"can_receive":true}\n' ;;
+  *) : > "$FM_HOME/REQUEST-SENT"; exit 1 ;;
+esac
+"#;
+
+const HOLD: &str = r#"#!/bin/sh
+case "$1" in
+  --help) printf 'Usage:\n  fm-captain-hold.sh answers [<legacy-origin> | --any-origin] --source <provenance>   (keyed answers on stdin)\n' ;;
+  *) : > "$FM_HOME/ANSWER-SENT"; exit 1 ;;
+esac
+"#;
+
+fn write_script(path: &Path, text: &str) {
+    fs::write(path, text).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 struct FakeHome {
     root: PathBuf,
 }
@@ -19,13 +46,9 @@ impl FakeHome {
         fs::create_dir_all(root.join("data")).unwrap();
         fs::create_dir_all(root.join("state")).unwrap();
         fs::write(root.join("snapshot.json"), FIXTURE).unwrap();
-        let script_path = root.join("bin/fm-fleet-snapshot.sh");
-        fs::write(&script_path, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&root.join("bin/fm-fleet-snapshot.sh"), script);
+        write_script(&root.join("bin/fm-inbox.sh"), INBOX);
+        write_script(&root.join("bin/fm-captain-hold.sh"), HOLD);
         fs::write(
             root.join("data/projects.md"),
             "# Projects\n\n- Shop [direct-PR] - a shop\n- Site [direct-PR] - a site\n- tool - a tool\n- legacy [local-only] - old\n- kanbr [no-mistakes] - the board\n",
@@ -132,6 +155,38 @@ fn doctor_passes_on_a_healthy_home() {
     assert!(text.contains("ok    snapshot "), "{text}");
     assert!(text.contains("ok    backlog rows"), "{text}");
     assert!(text.contains("reads state/<id>.meta"), "{text}");
+    for line in [
+        "ok    inbox requests",
+        "ok    inbox receipts    bin/fm-inbox.sh receipts reads 0 pending and 1 handled",
+        "ok    firstmate ready",
+        "ok    answer intake",
+        "writes bin/fm-inbox.sh note --request-id --json",
+        "writes bin/fm-captain-hold.sh answers",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+    // The fixture's second mate lives at a path this machine does not have.
+    assert!(text.contains("warn  mate intakes"), "{text}");
+}
+
+#[test]
+fn doctor_fails_when_firstmate_cannot_take_requests() {
+    let home = FakeHome::serving_fixture("doctor-inbox");
+    write_script(
+        &home.root.join("bin/fm-inbox.sh"),
+        "#!/bin/sh\n[ \"$1\" = --help ] && printf 'fm-inbox.sh note <text>...\\nfm-inbox.sh receipts\\n' && exit 0\nexit 1\n",
+    );
+    fs::remove_file(home.root.join("bin/fm-captain-hold.sh")).unwrap();
+    let out = kanbr(&["doctor"], Some(&home.root));
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("FAIL  inbox requests    bin/fm-inbox.sh lacks note --request-id"),
+        "{text}"
+    );
+    assert!(text.contains("FAIL  inbox receipts"), "{text}");
+    assert!(text.contains("warn  firstmate ready"), "{text}");
+    assert!(text.contains("FAIL  answer intake"), "{text}");
 }
 
 #[test]

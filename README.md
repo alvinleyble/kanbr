@@ -7,8 +7,13 @@ what is ready to start, what is being built, and how far each finished change ha
 travelled from Dev through Staging to Live. Decisions that are waiting on you are
 flagged in red and pinned to the top, so none of them hide in a busy column.
 
-Kanbr is **read-only**. It reads Firstmate's state and your projects' git history,
-and never changes either.
+Kanbr reads Firstmate's state and your projects' git history. You can also act
+from the board: answer a decision in place, or drag a card forward to ask for the
+next step (mark it ready, start a worker, merge its PR, promote to Staging or
+Live). Each action is a **request** that Firstmate carries out through its own
+guarded scripts. Kanbr never merges, promotes, spawns a worker, or edits the
+backlog itself, never writes a project repository or the forge, and never stores
+a passphrase. See [Acting from the board](#acting-from-the-board).
 
 ```text
  Kanbr   1 All 36   2 firstmate 7   3 kanbr 4   4 Leyble-Hub 21   5 Portfolio 2
@@ -111,7 +116,8 @@ strip, to jump from one to the next.
 
 Press `Enter` (or double-click a card) for the details: hold reason, blockers,
 branch, worktree, pane, PR link, the commit a change landed as, last status event,
-and notes.
+and notes. On a card waiting on you, `Enter` opens its decision instead, and `d`
+still shows the details.
 
 A plain grey card is a merged change with no Firstmate card (see
 [Releases](#releases)).
@@ -129,7 +135,9 @@ line says so. Press `n` to list them all.
 | --- | --- |
 | `←` `→` / `h` `l` | move between columns |
 | `↑` `↓` / `j` `k`, `PgUp` `PgDn`, `g` `G` | move between cards |
-| `Enter`, double-click | card details |
+| `Enter`, double-click | answer the decision of a `⚑` card in place; otherwise card details |
+| `d` | card details |
+| drag a card, `m`, `>` | ask Firstmate to move the card to the next column (see [Acting from the board](#acting-from-the-board)) |
 | `1`-`9`, `0`, `Tab`, click | switch project tab (`1` is All) |
 | `w`, click the strip | jump to the next card waiting on you |
 | `n` | list notices |
@@ -138,6 +146,125 @@ line says so. Press `n` to list them all.
 | `r` | refresh now |
 | `?` | help |
 | `q` | quit |
+
+## Acting from the board
+
+Kanbr acts only through Firstmate. It never performs a merge, promotion, spawn, or
+backlog change itself: it delivers a request to Firstmate, Firstmate does the real
+work with its existing guarded scripts, and the board shows the result once
+Firstmate's own state does.
+
+### Answering a decision
+
+Press `Enter` on a card with a red `⚑` badge. The dialog shows the question (the
+hold reason, or the worker's open question) and takes your answer in your own
+words.
+
+- **A task held for your call** is answered through Firstmate's keyed-answer
+  intake, `bin/fm-captain-hold.sh answers --source "kanbr board"`, in the home that
+  owns the task (a second mate's call goes to that second mate's home), exactly
+  like Captain's Deck. `Tab` picks what the answer does: **resume the work**
+  (release the hold, the default for held work) or **close the call** (done, the
+  default for a question-only call). The intake records your words in the task and
+  applies every guard it has; Kanbr then files an inbox note so Firstmate wakes up
+  and acts on the answer. The intake's reserved word `reconcile` is refused in the
+  dialog: it asks Firstmate to re-check, it is not an answer.
+- **A worker that stopped to ask** has no held task, so the answer goes to
+  Firstmate as a request note, and Firstmate relays it to the worker. The badge
+  clears when the worker's decision is resolved.
+
+### Dragging a card
+
+Drag a card onto the next column (or select it and press `m` or `>`) to ask for
+that step. Kanbr first shows what it will ask, then sends it when you press `Enter`.
+
+| Drag | What Kanbr asks Firstmate for |
+| --- | --- |
+| Booked to Ready | mark it talked through and ready: lift its hold |
+| Ready to Building | a worker: Firstmate recommends two models and puts the pick to you as a decision on the card, which you answer in place (while you pick, the card waits in Booked with its red badge, still `requested`) |
+| Building to Dev | your merge word for the card's PR. Kanbr reads the PR's checks first (`gh pr view`) and sends the word only when every check is green; if they are red, still running, or cannot be read, the card snaps back with the reason |
+| Dev to Staging | promote the project's dev branch to staging; Kanbr prompts for the staging passphrase |
+| Staging to Live | promote the project's staging branch to main; Kanbr prompts for the main passphrase |
+
+A card moves one lane at a time, to the next lane its project uses: a project with
+no staging branch goes from Dev to Live (a main promotion), and one with only
+`main` merges from Building straight to Live (with the main passphrase). A
+promotion moves everything in the lane, and the confirmation lists it, with any
+database migrations going live. Backward drags are refused, since they would mean
+reverts; so are drags of a halted project's cards.
+
+### Requested, moved, or snapped back
+
+A drag is a request, not the move. The card stays where it is and shows
+`⇢ requested`, then `Firstmate on it` once Firstmate picks the request up. It moves
+only when Firstmate's state shows the step happened: the backlog, the worker list,
+the PR, or git puts the card in the new column. Then it shows `✓ moved`.
+
+Otherwise it snaps back and shows `↩` with the reason, on the card and in its
+details, when:
+
+- Kanbr would not ask (a backward or skipping drag, no PR to merge, red checks);
+- Firstmate replies `refused: <reason>` (or `failed:` or `declined:`);
+- nothing happens within `request_timeout` minutes (30 by default). The reason says
+  whether Firstmate ever picked the note up; the note stays in Firstmate's inbox,
+  so Firstmate may still act on it.
+
+A `done:` reply alone does not move a card: it waits for the board to see the
+change. A promotion shows once the project's clone has fetched (Kanbr never
+fetches). Any other reply is shown on the card while the request stays open.
+Requests are tracked only while the board is open.
+
+### How a request reaches Firstmate
+
+Every drag, and every worker answer, is a captain inbox note saved with
+`bin/fm-inbox.sh note --request-id <id> --json -`, the same inbox the captain's
+notes and voice handover use:
+
+- it is **durable**: a file in Firstmate's `state/inbox/` that survives a crash;
+- it is **typed**: the note is a `kanbr-request.v1` record, one `key: value` field
+  per line (`action`, `project`, `card`, `from`, `to`, `pr`, `branches`, the
+  changes a promotion moves) plus a plain-language `ask:` line naming Firstmate's
+  guarded path;
+- a retry with the same request id **replays** the note instead of filing a second
+  request;
+- saving it **wakes Firstmate** with one `check` wake-up, and Firstmate answers
+  with `bin/fm-inbox.sh reply`, which Kanbr reads back with `bin/fm-inbox.sh
+  receipts` every 10 seconds while a request is open.
+
+The request body goes to the script on stdin, never in its arguments, so it does
+not appear in the process list.
+
+### Passphrases
+
+A merge or promotion that lands on a lane listed in `passphrase_lanes` (Staging and
+Live by default) needs that branch's passphrase, the word Firstmate's
+`bin/fm-pr-merge.sh` checks against the digest in its `config/merge-passphrases`.
+Kanbr prompts for it in the confirmation. The prompt is masked: it shows one `•`
+per character and never the text.
+
+Kanbr never writes the passphrase to its config, a log, a cache, or any file of its
+own, and never shows it. It lives in memory only until the request note is
+written, and that memory is overwritten with zeros right after. Exactly where it
+does go:
+
+- **Into the one request note for that action.** It is the note's last line
+  (`passphrase (main): <word>`), after a line telling Firstmate to pass it only to
+  `bin/fm-pr-merge.sh` and never store or repeat it.
+- **The note is a plain-text file in Firstmate's home.** It is written to
+  `state/inbox/<note-id>.note`, moved to `state/inbox/handled/` when Firstmate
+  acknowledges it, and kept there until Firstmate's inbox is cleaned up. Anyone
+  who can read Firstmate's home can read the word there.
+- **Firstmate's session sees it.** Firstmate reads the note when it wakes, so the
+  word enters its transcript and its model context, just as when you type the
+  word to Firstmate in chat.
+- **`bin/fm-inbox.sh receipts` and `list` print note bodies**, so the word appears
+  in their output while the note exists. Kanbr reads `receipts` and keeps only each
+  note's id, acknowledgement, and reply; it never keeps or shows a note body.
+- **Not in the wake-up line.** Firstmate's wake queue quotes the first 100
+  characters of a note; the passphrase always sits well after them.
+- **Not in the process list.** The note body goes to `fm-inbox.sh` on stdin.
+
+Leave `passphrase_lanes` empty if your Firstmate home gates no branches.
 
 ## Install
 
@@ -250,6 +377,14 @@ live_branch = main
 grill_words = grill
 halted_words = halted
 
+# Release lanes whose merges and promotions prompt for that branch's
+# passphrase (from dev, staging, live). Leave empty to never prompt. Kanbr
+# never stores the passphrase, here or anywhere.
+passphrase_lanes = staging, live
+
+# Minutes a request waits for its outcome before the card snaps back.
+request_timeout = 30
+
 # How many days finished work that git does not place stays on the board:
 # finished work with no PR (also cleared by the project's next release), and
 # merged work whose PR is not in the project's clone yet.
@@ -264,9 +399,11 @@ An unknown key or a bad value is an error, so a typo can't be silently ignored.
 
 ## `kanbr doctor`
 
-`kanbr doctor` checks every Firstmate surface Kanbr reads and exits non-zero if any
-of them is broken. Run it after every Firstmate update, so a change that breaks
-Kanbr shows up right away rather than as a silently empty board.
+`kanbr doctor` checks every Firstmate surface Kanbr reads or writes and exits
+non-zero if any of them is broken. Run it after every Firstmate update, so a change
+that breaks Kanbr shows up right away rather than as a silently empty board or a
+lost request. Every check is read-only: doctor never files a note or feeds the
+answer intake.
 
 It checks:
 
@@ -276,6 +413,14 @@ It checks:
 - every backlog row, worker row, and second-mate record carries each field Kanbr
   maps onto the board. It names any field that is missing;
 - the second-mate registry is readable, and every registered home is readable;
+- `bin/fm-inbox.sh` takes `note --request-id --json` with the body on stdin, `reply`,
+  and `receipts` (from its help), and `receipts` prints schema
+  `fm-inbox-receipts.v1`: drag requests can be sent and their replies read;
+- `bin/fm-inbox.sh ready` says Firstmate is running to take requests (a warning
+  when it is not: requests are saved but wait);
+- `bin/fm-captain-hold.sh` has the `answers --source` keyed-answer intake (from
+  its help), and each second mate's home has one too (a warning names any that
+  does not: answer those calls from chat);
 - each live worker's `state/<id>.meta` is readable and names a model;
 - `data/projects.md` lists the registered projects;
 - each project's clone can be read: the branch behind each of Dev, Staging, and Live,
@@ -283,21 +428,25 @@ It checks:
   fetched (a clone of a project on the board that has not fetched for a week is a
   warning, since the board lags the forge until it does);
 - `gh` is installed and signed in (optional: it is only asked about a merged PR whose
-  merge message has no PR number, and about the promotion PR behind a fast-forward
-  release). A fast-forward release whose start is unknown is a warning;
+  merge message has no PR number, about the promotion PR behind a fast-forward
+  release, and about a PR's checks before a merge request; without it, a drag to
+  merge is refused). A fast-forward release whose start is unknown is a warning;
 - the snapshot actually produces cards (open backlog rows with no cards means the
   data shape changed).
 
 ```text
   ok    snapshot          bin/fm-fleet-snapshot.sh --json ran in 2.5s, schema fm-fleet-snapshot.v1
   ok    backlog rows      26 structured rows carry every field Kanbr reads
+  ok    inbox requests    bin/fm-inbox.sh takes note --request-id --json with the body on stdin, reply, and receipts: drags and worker answers can be requested
+  ok    firstmate ready   Firstmate is running and receives requests; wake consumer healthy (supervised)
+  ok    answer intake     bin/fm-captain-hold.sh answers --source takes keyed answers: decisions can be answered in place
   ok    project git       firstmate: origin/main; latest release 25 Sep #9; fetched 18h ago
   ok    project git       Leyble-Hub: origin/dev origin/staging origin/main; latest release 10 Sep #122 v1.2.1; 2 database change(s) waiting in staging; fetched 38m ago
   ok    gh                installed and signed in; asked only about a merged PR whose merge message has no PR number, and the promotion PR behind a fast-forward release
   ok    board             36 cards (Booked 12 · Ready 2 · Building 2 · Dev 0 · Staging 12 · Live 8), 6 waiting on you, 7 tabs
 ```
 
-### What Kanbr reads
+### What Kanbr reads and writes
 
 | Surface | Why |
 | --- | --- |
@@ -307,9 +456,15 @@ It checks:
 | each project's git history | which configured branches back Dev, Staging, and Live; how far each merged change has reached; the latest release, app version, and database migrations. Read-only: `for-each-ref`, `log`, `rev-list`, `merge-base`, `diff-tree`, `cherry`, `patch-id`, `ls-tree`, `cat-file`, the Live ref's reflog (`log -g`, only after a fast-forward release), and the modification time of `FETCH_HEAD` |
 | `gh pr view` (optional) | the commit a merged PR landed as, only for a Firstmate card whose PR number is in no merge message |
 | `gh pr list` (optional) | the merged promotion PR behind a fast-forward to the Live branch, and the branch's commit before it: where that release starts |
+| `gh pr view --json state,isDraft,statusCheckRollup` (optional) | before a merge request: whether the PR is open and every check is green |
+| `bin/fm-inbox.sh note --request-id <id> --json -` (**writes**) | each drag request, worker answer, and answer wake-up, as a durable `kanbr-request.v1` captain inbox note that wakes Firstmate |
+| `bin/fm-inbox.sh receipts`, `ready` | whether Firstmate picked a request up and its reply; whether Firstmate is running to take requests |
+| `bin/fm-captain-hold.sh answers --source "kanbr board"` (**writes**) | a decision answer, through Firstmate's keyed-answer intake, in the home that owns the task |
 
-Kanbr runs the snapshot with `FM_HOME` set to your home. It never writes any
-Firstmate file or project repository, and never fetches. The snapshot may refresh
+Kanbr runs the snapshot and every Firstmate script with `FM_HOME` set to the home
+it addresses. It writes nothing into a Firstmate home itself: the only changes it
+causes are the notes and answers those two Firstmate scripts record when you act.
+It never writes a project repository, and never fetches. The snapshot may refresh
 Firstmate's own cached copies of remote second-mate summaries, as it does whenever
 Firstmate itself runs it. Kanbr reads the git history only of projects on the board
 (a halted project's is not read), so dormant repositories never add tabs.

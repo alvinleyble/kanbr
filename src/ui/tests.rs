@@ -137,11 +137,23 @@ fn enter_opens_details_and_esc_closes() {
 fn double_click_opens_details() {
     let mut a = app();
     draw(&mut a, 200, 50);
-    let (rect, col, idx) = a.hits.cards[0];
+    let hits = a.hits.cards.clone();
+    let plain = hits
+        .iter()
+        .copied()
+        .find(|&(_, col, idx)| !a.column_cards(col)[idx].decision)
+        .unwrap();
+    let (rect, col, idx) = plain;
     click(&mut a, rect.x + 2, rect.y);
     click(&mut a, rect.x + 2, rect.y);
     assert_eq!((a.col, a.sel[col]), (col, idx));
     assert!(matches!(a.modal, Modal::Details(_)));
+    press(&mut a, KeyCode::Esc);
+    // A card waiting on the captain opens its decision instead.
+    let (rect, _, _) = hits[0];
+    click(&mut a, rect.x + 2, rect.y + 1);
+    click(&mut a, rect.x + 2, rect.y + 1);
+    assert!(matches!(a.modal, Modal::Decide(_)), "{:?}", a.modal);
 }
 
 #[test]
@@ -149,7 +161,7 @@ fn cards_fit_their_width() {
     let b = fixture_board();
     for width in [12usize, 24, 40] {
         for c in &b.cards {
-            for line in card_lines(c, width, false, now()) {
+            for line in card_lines(c, width, false, now(), None) {
                 assert!(line.width() <= width, "{} at {width}: {:?}", c.id, line);
             }
         }
@@ -160,14 +172,14 @@ fn cards_fit_their_width() {
 fn card_header_has_project_pr_and_second_mate_tag() {
     let b = fixture_board();
     let c = b.cards.iter().find(|c| c.id == "site-footer").unwrap();
-    let lines = card_lines(c, 30, false, now());
+    let lines = card_lines(c, 30, false, now(), None);
     let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
         header.contains("Site") && header.contains("#15") && header.contains("2nd"),
         "{header}"
     );
     let d = b.cards.iter().find(|c| c.id == "shop-print-queue").unwrap();
-    let title: String = card_lines(d, 40, false, now())[1]
+    let title: String = card_lines(d, 40, false, now(), None)[1]
         .spans
         .iter()
         .map(|s| s.content.as_ref())
@@ -321,11 +333,11 @@ fn clicking_a_release_header_opens_the_release_details() {
 fn cards_without_a_firstmate_card_are_grey() {
     let b = crate::model::tests::release_board();
     let outside = b.cards.iter().find(|c| c.id == "Shop#141").unwrap();
-    let lines = card_lines(outside, 30, false, now());
+    let lines = card_lines(outside, 30, false, now(), None);
     let title = lines[1].spans.last().unwrap();
     assert_eq!(title.style.fg, Some(Color::Gray));
     let tracked = b.cards.iter().find(|c| c.id == "shop-deploy-hook").unwrap();
-    let lines = card_lines(tracked, 30, false, now());
+    let lines = card_lines(tracked, 30, false, now(), None);
     assert_eq!(lines[1].spans.last().unwrap().style.fg, Some(Color::White));
 }
 
@@ -336,4 +348,256 @@ fn base64_matches_the_standard_alphabet() {
     assert_eq!(base64(b"fo"), "Zm8=");
     assert_eq!(base64(b"foo"), "Zm9v");
     assert_eq!(base64("Shop — 1".as_bytes()), "U2hvcCDigJQgMQ==");
+}
+
+// ------------------------------------------------------------ acting
+
+fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+    app.handle_mouse(MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+fn typing(app: &mut App, text: &str) {
+    for ch in text.chars() {
+        press(app, KeyCode::Char(ch));
+    }
+}
+
+/// Drags card `id` onto column `to` with the mouse.
+fn drag(app: &mut App, id: &str, to: usize) {
+    draw(app, 252, 40);
+    let &(rect, col, _) = app
+        .hits
+        .cards
+        .iter()
+        .find(|&&(_, col, idx)| app.column_cards(col)[idx].id == id)
+        .unwrap_or_else(|| panic!("{id} not on screen"));
+    let (target, _) = app.hits.columns[to];
+    mouse(
+        app,
+        MouseEventKind::Down(MouseButton::Left),
+        rect.x + 2,
+        rect.y,
+    );
+    assert_eq!(app.col, col);
+    let (tx, ty) = (target.x + 2, target.y + target.height / 2);
+    mouse(app, MouseEventKind::Drag(MouseButton::Left), tx, ty);
+    mouse(app, MouseEventKind::Up(MouseButton::Left), tx, ty);
+}
+
+fn shop_app() -> App {
+    let mut a = release_app();
+    let shop = tab_index(&a, "Shop");
+    a.select_tab(shop);
+    a
+}
+
+fn moved(board: &Board, id: &str, to: Column) -> Board {
+    let mut b = board.clone();
+    b.cards.iter_mut().find(|c| c.id == id).unwrap().column = to;
+    b
+}
+
+#[test]
+fn a_drag_is_a_request_with_a_masked_passphrase() {
+    let mut a = shop_app();
+    drag(&mut a, "Shop#144", Column::Live.index());
+    assert_eq!(a.modal, Modal::Confirm);
+    let plan = &a.confirm.as_ref().unwrap().plan;
+    assert_eq!(plan.action, actions::Action::Promote);
+    assert_eq!(plan.passphrase.as_deref(), Some("main"));
+    let screen = draw(&mut a, 252, 40);
+    assert!(
+        screen.contains("Ask Firstmate to promote Shop to Live"),
+        "{screen}"
+    );
+    assert!(screen.contains("main passphrase:"), "{screen}");
+    // Sending without the passphrase is refused in place.
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.modal, Modal::Confirm);
+    assert!(a.jobs.is_empty());
+    // Every key is passphrase text now, including the board's own keys.
+    typing(&mut a, "qmx7");
+    assert!(!a.quit);
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains("main passphrase: ••••"), "{screen}");
+    assert!(!screen.contains("qmx7"), "{screen}");
+    // A stray click does not throw the prompt away.
+    click(&mut a, 0, 0);
+    assert_eq!(a.modal, Modal::Confirm);
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.modal, Modal::None);
+    assert!(a.confirm.is_none());
+    let Some(Job::Request {
+        plan,
+        request_id,
+        passphrase: Some(word),
+    }) = a.jobs.pop()
+    else {
+        panic!("no request job");
+    };
+    assert_eq!(word.expose(), "qmx7");
+    assert!(request_id.starts_with("kanbr-promote-Shop-144-"));
+    assert_eq!(plan.card_id, "Shop#144");
+    assert!(matches!(a.tracker.mark("Shop#144"), Some(Mark::Open(t)) if t.contains("sending")));
+
+    a.apply(Msg::Action(Outcome::Requested {
+        card_id: "Shop#144".into(),
+        note_id: "n1".into(),
+        warning: None,
+    }));
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains("⇢ requested: promote"), "{screen}");
+    // Still in Staging until the board shows it in Live.
+    let board = a.board.clone().unwrap();
+    a.apply(Msg::Loaded(Box::new(Ok(board.clone()))));
+    assert!(a.tracker.get("Shop#144").is_some());
+    a.apply(Msg::Loaded(Box::new(Ok(moved(
+        &board,
+        "Shop#144",
+        Column::Live,
+    )))));
+    assert!(a.tracker.get("Shop#144").is_none());
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains("✓ moved to Live"), "{screen}");
+}
+
+#[test]
+fn a_backward_or_skipping_drag_snaps_back_with_the_reason() {
+    let mut a = shop_app();
+    drag(&mut a, "Shop#144", Column::Dev.index());
+    assert_eq!(a.modal, Modal::None);
+    assert!(a.jobs.is_empty());
+    let Some(Mark::Failed(why)) = a.tracker.mark("Shop#144") else {
+        panic!("no snap-back");
+    };
+    assert!(why.contains("revert"), "{why}");
+    let screen = draw(&mut a, 252, 40);
+    assert!(
+        screen.contains("↩ Kanbr only moves work forward"),
+        "{screen}"
+    );
+    drag(&mut a, "shop-held-work", Column::Building.index());
+    let Some(Mark::Failed(why)) = a.tracker.mark("shop-held-work") else {
+        panic!("no snap-back");
+    };
+    assert!(why.contains("one lane at a time"), "{why}");
+}
+
+#[test]
+fn m_asks_for_the_next_lane_and_esc_cancels() {
+    let mut a = release_app();
+    assert!(a.select_card("site-launch-post"));
+    press(&mut a, KeyCode::Char('m'));
+    assert_eq!(a.modal, Modal::Confirm);
+    assert_eq!(
+        a.confirm.as_ref().unwrap().plan.action,
+        actions::Action::Ready
+    );
+    press(&mut a, KeyCode::Esc);
+    assert_eq!(a.modal, Modal::None);
+    assert!(a.jobs.is_empty() && a.tracker.get("site-launch-post").is_none());
+    press(&mut a, KeyCode::Char('>'));
+    press(&mut a, KeyCode::Char('y'));
+    assert!(matches!(
+        a.jobs.as_slice(),
+        [Job::Request {
+            passphrase: None,
+            ..
+        }]
+    ));
+    // A second request for the same card waits for the first.
+    press(&mut a, KeyCode::Char('m'));
+    assert_eq!(a.modal, Modal::None);
+    assert_eq!(a.jobs.len(), 1);
+    // Live has no next lane.
+    assert!(a.select_card("Shop#141"));
+    press(&mut a, KeyCode::Char('m'));
+    assert!(matches!(a.tracker.mark("Shop#141"), Some(Mark::Failed(t)) if t.contains("last lane")));
+}
+
+#[test]
+fn enter_on_a_waiting_card_answers_it_in_place() {
+    let mut a = release_app();
+    assert!(a.select_card("shop-promote-main"));
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.modal, Modal::Decide("shop-promote-main".into()));
+    assert!(
+        a.decide.as_ref().unwrap().release,
+        "held work resumes by default"
+    );
+    let screen = draw(&mut a, 200, 50);
+    assert!(screen.contains("keyed-answer intake"), "{screen}");
+    typing(&mut a, "reconcile");
+    press(&mut a, KeyCode::Enter);
+    assert!(
+        a.decide
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("reserved")
+    );
+    press(&mut a, KeyCode::Char('u'));
+    a.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typing(&mut a, "wait for q4 numbers");
+    press(&mut a, KeyCode::Tab);
+    assert!(!a.decide.as_ref().unwrap().release);
+    assert!(!a.quit, "q is text in the answer");
+    press(&mut a, KeyCode::Enter);
+    assert_eq!(a.modal, Modal::None);
+    let Some(Job::Answer(job)) = a.jobs.pop() else {
+        panic!("no answer job")
+    };
+    assert_eq!(job.answer, "wait for q4 numbers");
+    assert!(!job.release);
+    assert_eq!(
+        job.ask,
+        Ask::Hold {
+            home: None,
+            work_item: true
+        }
+    );
+    assert!(matches!(
+        a.tracker.mark("shop-promote-main"),
+        Some(Mark::Open(_))
+    ));
+    // A question-only call closes by default; a card with no decision shows details.
+    assert!(a.select_card("shop-print-queue"));
+    press(&mut a, KeyCode::Enter);
+    assert!(!a.decide.as_ref().unwrap().release);
+    press(&mut a, KeyCode::Esc);
+    assert!(a.select_card("site-launch-post"));
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.modal, Modal::Details(_)));
+}
+
+#[test]
+fn requests_time_out_and_replies_are_polled() {
+    let mut a = release_app();
+    assert!(a.select_card("site-launch-post"));
+    press(&mut a, KeyCode::Char('m'));
+    press(&mut a, KeyCode::Enter);
+    a.jobs.clear();
+    a.apply(Msg::Action(Outcome::Requested {
+        card_id: "site-launch-post".into(),
+        note_id: "n7".into(),
+        warning: None,
+    }));
+    a.tick();
+    assert!(matches!(a.jobs.as_slice(), [Job::Poll]));
+    a.jobs.clear();
+    a.tick();
+    assert!(a.jobs.is_empty(), "polls are spaced out");
+    a.set_now(now() + a.config.request_timeout_mins * 60);
+    a.tick();
+    let Some(Mark::Failed(why)) = a.tracker.mark("site-launch-post") else {
+        panic!("no timeout")
+    };
+    assert!(why.contains("has not picked up note n7"), "{why}");
 }

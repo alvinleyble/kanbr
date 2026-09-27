@@ -665,6 +665,27 @@ fn the_worker_pick_is_answered_in_place_while_the_request_stays_open() {
         a.tracker.mark("site-dark-mode"),
         Some(Mark::Open(t)) if t.contains("requested: worker")
     ));
+    // The recorded pick is not answered again before the board shows it.
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.modal, Modal::Details(_)));
+    press(&mut a, KeyCode::Esc);
+    a.apply(Msg::Loaded(Box::new(Ok(board.clone()))));
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.modal, Modal::Details(_)));
+    press(&mut a, KeyCode::Esc);
+    assert!(a.jobs.iter().all(|j| !matches!(j, Job::Answer(_))));
+    let mut released = board.clone();
+    let card = released
+        .cards
+        .iter_mut()
+        .find(|c| c.id == "site-dark-mode")
+        .unwrap();
+    card.decision = false;
+    card.ask = None;
+    a.apply(Msg::Loaded(Box::new(Ok(released))));
+    let p = a.tracker.get("site-dark-mode").unwrap();
+    assert!(!p.answered, "the board shows the pick taken");
+    assert_eq!(p.request_id, request_id, "the move stays open");
     // The card moves only once the board shows the worker.
     let card = board
         .cards

@@ -63,6 +63,8 @@ pub struct Pending {
     /// The request id of a model pick answered while this worker request
     /// stays open, until its outcome is back.
     pub answering: Option<String>,
+    /// The model pick is recorded; the board still shows the decision open.
+    pub answered: bool,
 }
 
 impl Pending {
@@ -79,6 +81,7 @@ impl Pending {
             reported_done: false,
             warning: None,
             answering: None,
+            answered: false,
         }
     }
 
@@ -192,7 +195,7 @@ impl Tracker {
     /// to the captain, with no answer already on its way.
     pub fn can_answer(&self, card_id: &str) -> bool {
         self.get(card_id)
-            .is_none_or(|p| p.is_worker_request() && p.answering.is_none())
+            .is_none_or(|p| p.is_worker_request() && p.answering.is_none() && !p.answered)
     }
 
     /// Starts an answer to `card_id`'s decision. An open worker request for
@@ -210,10 +213,11 @@ impl Tracker {
         }
     }
 
-    fn answered_alongside(&mut self, request_id: &str) {
+    fn answered_alongside(&mut self, request_id: &str, recorded: bool) {
         for p in &mut self.pending {
             if p.answering.as_deref() == Some(request_id) {
                 p.answering = None;
+                p.answered = recorded;
             }
         }
     }
@@ -277,7 +281,7 @@ impl Tracker {
                 if self.by_request_mut(&request_id).is_some() {
                     self.refuse(&card_id, &reason, now);
                 } else {
-                    self.answered_alongside(&request_id);
+                    self.answered_alongside(&request_id, false);
                     self.say(format!("{card_id}: not sent: {reason}"), false, now);
                 }
             }
@@ -298,7 +302,7 @@ impl Tracker {
                         p.note_id = note_id;
                         p.warning = warning;
                     }
-                    None => self.answered_alongside(&request_id),
+                    None => self.answered_alongside(&request_id, true),
                 }
                 self.say(text, true, now);
             }
@@ -338,6 +342,10 @@ impl Tracker {
 
     /// Settles every request whose outcome the board now shows.
     pub fn on_board(&mut self, board: &Board, now: i64) {
+        for p in &mut self.pending {
+            let open = board.cards.iter().any(|c| c.id == p.card_id && c.decision);
+            p.answered &= open;
+        }
         let mut done = Vec::new();
         for p in self.pending.iter().filter(|p| !p.sending) {
             let card = board.cards.iter().find(|c| c.id == p.card_id);

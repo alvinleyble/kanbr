@@ -143,7 +143,39 @@ pub(crate) fn shop_git() -> ProjectGit {
         g.by_pr.insert(c.pr.unwrap(), Role::Change(i));
         g.by_commit.insert(c.commit.clone(), Role::Change(i));
     }
-    g.by_pr.insert(150, Role::Promotion);
+    g.promotions = vec![
+        Change {
+            commit: "r".repeat(40),
+            home: Column::Live,
+            column: Column::Live,
+            in_release: true,
+            pr: Some(150),
+            title: "Promote staging to main".into(),
+            time: parse_date("2026-09-25T10:00:00Z").unwrap(),
+        },
+        Change {
+            commit: format!("p{:0>39}", 148),
+            home: Column::Staging,
+            column: Column::Staging,
+            in_release: false,
+            pr: Some(148),
+            title: "Promote dev to staging".into(),
+            time: parse_date("2026-09-26T10:00:00Z").unwrap(),
+        },
+        Change {
+            commit: format!("p{:0>39}", 120),
+            home: Column::Live,
+            column: Column::Live,
+            in_release: false,
+            pr: Some(120),
+            title: "Promote staging to main".into(),
+            time: parse_date("2026-09-20T10:00:00Z").unwrap(),
+        },
+    ];
+    for (i, p) in g.promotions.iter().enumerate() {
+        g.by_pr.insert(p.pr.unwrap(), Role::Promotion(i));
+        g.by_commit.insert(p.commit.clone(), Role::Promotion(i));
+    }
     g.release = Some(Release {
         commit: "r".repeat(40),
         time: parse_date("2026-09-25T10:00:00Z").unwrap(),
@@ -669,21 +701,81 @@ fn live_holds_only_the_latest_release() {
     assert_eq!(rel.refs.last().unwrap().1, "origin/main");
 }
 
-#[test]
-fn promotion_prs_are_release_events_not_cards() {
+/// The fixture with a finished Shop card per PR URL, each titled by its id.
+fn with_shop_cards(prs: &[(&str, &str)]) -> Value {
     let mut snap: Value = serde_json::from_str(FIXTURE).unwrap();
-    let mut rec = snap["backlog"]["records"]
+    let base = snap["backlog"]["records"]
         .as_array()
         .unwrap()
         .iter()
         .find(|r| r["id"] == "shop-deploy-hook")
         .unwrap()
         .clone();
-    rec["id"] = "shop-promote-main-done".into();
-    rec["pr_url"] = "https://github.com/acme/shop/pull/150".into();
-    snap["backlog"]["records"].as_array_mut().unwrap().push(rec);
+    for (id, url) in prs {
+        let mut rec = base.clone();
+        rec["id"] = (*id).into();
+        rec["title"] = (*id).into();
+        rec["kind"] = "ship".into();
+        rec["completion"] = serde_json::json!({"verb": "done", "date": "2026-09-26"});
+        rec["pr_url"] = (*url).into();
+        snap["backlog"]["records"].as_array_mut().unwrap().push(rec);
+    }
+    snap
+}
+
+#[test]
+fn promotion_cards_sit_in_the_lane_their_promotion_reached() {
+    let snap = with_shop_cards(&[
+        (
+            "shop-promote-staging",
+            "https://github.com/acme/shop/pull/148",
+        ),
+        (
+            "shop-promote-main-done",
+            "https://github.com/acme/shop/pull/150",
+        ),
+        ("shop-promote-old", "https://github.com/acme/shop/pull/120"),
+    ]);
     let b = board_with(&snap, &release_env());
-    assert!(!has(&b, "shop-promote-main-done"));
+
+    let staged = card(&b, "shop-promote-staging");
+    assert_eq!(staged.column, Column::Staging);
+    assert!(staged.promotion && !staged.not_release && !staged.in_release);
+    assert_eq!(staged.state, "promoted");
+    assert_eq!(staged.tone, Tone::Finished);
+    assert_eq!(staged.pr_number, Some(148));
+    assert!(
+        staged
+            .details
+            .iter()
+            .any(|(k, v)| *k == "Promotion" && v == "reached Staging"),
+        "{:?}",
+        staged.details
+    );
+
+    let released = card(&b, "shop-promote-main-done");
+    assert_eq!(released.column, Column::Live);
+    assert!(released.promotion && released.in_release);
+    assert_eq!(
+        b.release_cards(Some("Shop")).len(),
+        4,
+        "a promotion is not one of the release's changes"
+    );
+
+    assert!(
+        !has(&b, "shop-promote-old"),
+        "promoted to Live before the latest release"
+    );
+}
+
+#[test]
+fn a_back_merge_pr_is_not_a_card() {
+    let mut env = release_env();
+    let shop = env.gits.get_mut(Path::new("/fm/projects/Shop")).unwrap();
+    shop.by_pr.insert(151, Role::BackMerge);
+    let snap = with_shop_cards(&[("shop-back-merge", "https://github.com/acme/shop/pull/151")]);
+    let b = board_with(&snap, &env);
+    assert!(!has(&b, "shop-back-merge"));
 }
 
 #[test]
@@ -692,6 +784,14 @@ fn unmerged_finished_work_stays_in_live_until_the_next_release() {
     let c = card(&b, "shop-worth-fixing");
     assert_eq!(c.column, Column::Live);
     assert!(!c.in_release, "a report is not part of the release");
+    assert!(c.not_release && !c.promotion);
+    assert_eq!(c.tone, Tone::Muted);
+    let live = b.column_cards(Column::Live, Some("Shop"));
+    assert!(
+        live.last().unwrap().not_release,
+        "work that is not a release sits below the release"
+    );
+    assert_eq!(live.iter().filter(|c| c.not_release).count(), 1);
     let mut env = release_env();
     let shop = env.gits.get_mut(Path::new("/fm/projects/Shop")).unwrap();
     shop.release.as_mut().unwrap().time = parse_date("2026-09-26T08:00:00Z").unwrap();

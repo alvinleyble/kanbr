@@ -61,12 +61,13 @@ pub struct LaneRef {
     pub tip: String,
 }
 
-/// One change: a merged PR or a direct commit.
+/// One change: a merged PR or a direct commit. A promotion is tracked the
+/// same way, from the lane it landed on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Change {
     /// The commit that landed it on its first lane.
     pub commit: String,
-    /// The lane it landed on first.
+    /// The lane it landed on first (for a promotion, the lane it promoted to).
     pub home: Column,
     /// The furthest lane it has reached.
     pub column: Column,
@@ -104,7 +105,8 @@ pub type Promotions<'a> = &'a dyn Fn(&str, &str, &str) -> Option<(u64, String)>;
 pub enum Role {
     /// Index into [`ProjectGit::changes`].
     Change(usize),
-    Promotion,
+    /// Index into [`ProjectGit::promotions`].
+    Promotion(usize),
     BackMerge,
 }
 
@@ -116,6 +118,9 @@ pub struct ProjectGit {
     pub refs: Vec<LaneRef>,
     /// Every change found in the scanned history.
     pub changes: Vec<Change>,
+    /// Every promotion found in the scanned history, placed like a change:
+    /// in the furthest lane its landing commit has reached.
+    pub promotions: Vec<Change>,
     pub by_pr: HashMap<u64, Role>,
     pub by_commit: HashMap<String, Role>,
     pub release: Option<Release>,
@@ -432,45 +437,58 @@ impl Analysis<'_> {
             for i in 0..self.lanes[j].log.len() {
                 let c = self.lanes[j].log[i].clone();
                 let pr = pr_of(&c);
-                let role = match self.kind(j, i) {
-                    Kind::Change => {
-                        let mut reached = j;
-                        for (k, tip) in tips.iter().enumerate().skip(j + 1) {
-                            if self.present(&c, tip)? {
-                                reached = k;
-                            }
-                        }
-                        let in_release = live
-                            && known
-                            && reached == top
-                            && match &before {
-                                Some(b) => !self.present(&c, b)?,
-                                None => true,
-                            };
-                        let idx = pg.changes.len();
-                        pg.changes.push(Change {
-                            commit: c.sha.clone(),
-                            home: self.lanes[j].column,
-                            column: self.lanes[reached].column,
-                            in_release,
-                            pr: pr.as_ref().map(|p| p.0),
-                            title: pr
-                                .as_ref()
-                                .map_or_else(|| c.subject.clone(), |p| p.1.clone()),
-                            time: c.time,
-                        });
-                        pg.by_commit.insert(c.sha.clone(), Role::Change(idx));
-                        if let Some((num, _, _)) = pr {
-                            pg.by_pr.insert(num, Role::Change(idx));
-                        }
-                        continue;
+                let kind = self.kind(j, i);
+                let promotion = matches!(kind, Kind::Promotion { .. });
+                if kind == Kind::BackMerge {
+                    pg.by_commit.entry(c.sha.clone()).or_insert(Role::BackMerge);
+                    if let Some((num, _, _)) = pr {
+                        pg.by_pr.entry(num).or_insert(Role::BackMerge);
                     }
-                    Kind::Promotion { .. } => Role::Promotion,
-                    Kind::BackMerge => Role::BackMerge,
+                    continue;
+                }
+                // A commit on several lanes (a fast-forward) keeps the role
+                // it has on the lowest lane it landed on.
+                if promotion && pg.by_commit.contains_key(&c.sha) {
+                    continue;
+                }
+                let mut reached = j;
+                for (k, tip) in tips.iter().enumerate().skip(j + 1) {
+                    if self.present(&c, tip)? {
+                        reached = k;
+                    }
+                }
+                let in_release = live
+                    && known
+                    && reached == top
+                    && match &before {
+                        Some(b) => !self.present(&c, b)?,
+                        None => true,
+                    };
+                let landing = Change {
+                    commit: c.sha.clone(),
+                    home: self.lanes[j].column,
+                    column: self.lanes[reached].column,
+                    in_release,
+                    pr: pr.as_ref().map(|p| p.0),
+                    title: pr
+                        .as_ref()
+                        .map_or_else(|| c.subject.clone(), |p| p.1.clone()),
+                    time: c.time,
                 };
-                pg.by_commit.entry(c.sha.clone()).or_insert(role);
-                if let Some((num, _, _)) = pr {
-                    pg.by_pr.entry(num).or_insert(role);
+                if promotion {
+                    let role = Role::Promotion(pg.promotions.len());
+                    pg.promotions.push(landing);
+                    pg.by_commit.insert(c.sha.clone(), role);
+                    if let Some((num, _, _)) = pr {
+                        pg.by_pr.entry(num).or_insert(role);
+                    }
+                } else {
+                    let role = Role::Change(pg.changes.len());
+                    pg.changes.push(landing);
+                    pg.by_commit.insert(c.sha.clone(), role);
+                    if let Some((num, _, _)) = pr {
+                        pg.by_pr.insert(num, role);
+                    }
                 }
             }
         }

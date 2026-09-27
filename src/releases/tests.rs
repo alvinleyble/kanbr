@@ -189,6 +189,13 @@ fn change(pg: &ProjectGit, pr: u64) -> &Change {
     }
 }
 
+fn promotion(pg: &ProjectGit, pr: u64) -> &Change {
+    match pg.by_pr.get(&pr) {
+        Some(Role::Promotion(i)) => &pg.promotions[*i],
+        other => panic!("PR #{pr} is {other:?}, not a promotion"),
+    }
+}
+
 fn change_titled<'a>(pg: &'a ProjectGit, title: &str) -> &'a Change {
     pg.changes
         .iter()
@@ -240,8 +247,8 @@ fn merge_commit_promotions_place_each_change_in_its_furthest_lane() {
     assert_eq!(d.title, "chore: tidy config");
     assert_eq!(change(&pg, 3).column, Column::Dev);
     assert_eq!(change(&pg, 4).column, Column::Dev);
-    assert_eq!(pg.by_pr.get(&10), Some(&Role::Promotion));
-    assert_eq!(pg.by_pr.get(&11), Some(&Role::Promotion));
+    promotion(&pg, 10);
+    promotion(&pg, 11);
     let rel = pg.release.as_ref().unwrap();
     assert_eq!(rel.pr, Some(11));
     assert_eq!(rel.commit, r.sha("main"));
@@ -272,7 +279,7 @@ fn squash_promotions_are_found_by_content_even_after_a_hotfix() {
     let pg = r.analyze();
     assert_eq!(change(&pg, 1).column, Column::Staging);
     assert_eq!(change(&pg, 2).column, Column::Staging);
-    assert_eq!(pg.by_pr.get(&10), Some(&Role::Promotion));
+    promotion(&pg, 10);
 
     // A hotfix lands directly on main, so main and staging diverge before
     // the squash promotion: no tree matches, the file-by-file check must.
@@ -287,7 +294,7 @@ fn squash_promotions_are_found_by_content_even_after_a_hotfix() {
     let hot = change(&pg, 20);
     assert_eq!((hot.home, hot.column), (Column::Live, Column::Live));
     assert!(!hot.in_release, "the hotfix was its own, earlier release");
-    assert_eq!(pg.by_pr.get(&11), Some(&Role::Promotion));
+    promotion(&pg, 11);
     assert_eq!(change(&pg, 3).column, Column::Dev);
     assert_eq!(pg.release.as_ref().unwrap().pr, Some(11));
 
@@ -387,7 +394,7 @@ fn a_promotion_branch_merged_into_staging_is_a_promotion() {
         "promote: dev to staging - fix eight",
     ]);
     let pg = r.analyze();
-    assert_eq!(pg.by_pr.get(&132), Some(&Role::Promotion));
+    promotion(&pg, 132);
     assert_eq!(change(&pg, 8).column, Column::Staging);
     assert_eq!(change(&pg, 7).column, Column::Dev);
 }
@@ -556,8 +563,8 @@ fn a_merge_release_fast_forwarded_back_to_dev_keeps_its_pr() {
     );
     assert!(change(&pg, 2).in_release);
     assert!(!change(&pg, 1).in_release);
-    assert_eq!(pg.by_pr[&12], Role::Promotion);
-    assert_eq!(pg.by_pr[&13], Role::Promotion);
+    promotion(&pg, 12);
+    promotion(&pg, 13);
 }
 
 #[test]
@@ -602,7 +609,7 @@ fn a_three_lane_merge_release_fast_forwarded_back_to_dev_keeps_its_changes() {
     assert!(change(&pg, 2).in_release);
     assert!(!change(&pg, 1).in_release);
     for n in [10, 11, 12, 13] {
-        assert_eq!(pg.by_pr[&n], Role::Promotion);
+        promotion(&pg, n);
     }
 }
 
@@ -634,7 +641,7 @@ fn a_fast_forward_release_after_dev_synced_to_staging() {
     assert!(change(&pg, 3).in_release);
     assert_eq!(change(&pg, 3).home, Column::Dev);
     assert_eq!(change(&pg, 1).home, Column::Staging);
-    assert_eq!(pg.by_pr[&11], Role::Promotion);
+    promotion(&pg, 11);
     assert!(!change(&pg, 5).in_release);
 }
 
@@ -935,4 +942,43 @@ fn version_parsers() {
         toml_version("[package]\nversion.workspace = true\n", &["package"]),
         None
     );
+}
+
+#[test]
+fn promotions_sit_in_the_furthest_lane_they_reached() {
+    let r = three_lanes("promo-lanes");
+    r.merge_pr("dev", 1, "Settings page", &["settings"]);
+    r.merge_promote("dev", "staging", 10);
+    let pg = r.analyze();
+    let p = promotion(&pg, 10);
+    assert_eq!((p.home, p.column), (Column::Staging, Column::Staging));
+    assert!(!p.in_release);
+    assert_eq!(p.title, "Promote dev to staging");
+
+    // A squash promotion is found by content and placed the same way.
+    r.squash_pr("dev", 2, "feat: top bar", "bar");
+    r.squash_promote("dev", "staging", 11);
+    let pg = r.analyze();
+    assert_eq!(promotion(&pg, 11).column, Column::Staging);
+
+    // Releasing carries both into Live, as part of the release; the release
+    // promotion itself lands there.
+    r.merge_promote("staging", "main", 12);
+    let pg = r.analyze();
+    for n in [10, 11, 12] {
+        let p = promotion(&pg, n);
+        assert_eq!(p.column, Column::Live, "#{n}");
+        assert!(p.in_release, "#{n}");
+    }
+    assert_eq!(promotion(&pg, 12).home, Column::Live);
+
+    // The next release leaves them behind.
+    r.merge_pr("dev", 3, "Exports", &["exports"]);
+    r.merge_promote("dev", "staging", 13);
+    r.merge_promote("staging", "main", 14);
+    let pg = r.analyze();
+    for n in [10, 11, 12] {
+        assert!(!promotion(&pg, n).in_release, "#{n}");
+    }
+    assert!(promotion(&pg, 13).in_release);
 }

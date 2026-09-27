@@ -25,7 +25,7 @@ pub fn column_header(board: &Board, column: Column, project: Option<&str>) -> Ve
         return match column {
             Column::Live => live_forms(board, rel),
             Column::Staging => staging_forms(
-                board.column_cards(Column::Staging, Some(p)).len(),
+                board.changes_in(Column::Staging, Some(p)).len(),
                 rel.migrations.len(),
             ),
             _ => Vec::new(),
@@ -60,7 +60,7 @@ pub fn column_header(board: &Board, column: Column, project: Option<&str>) -> Ve
             ]
         }
         Column::Staging if board.releases.iter().any(|r| r.lanes.staging) => staging_forms(
-            board.column_cards(Column::Staging, None).len(),
+            board.changes_in(Column::Staging, None).len(),
             board.releases.iter().map(|r| r.migrations.len()).sum(),
         ),
         _ => Vec::new(),
@@ -164,7 +164,7 @@ pub fn details(board: &Board, project: Option<&str>, now: i64) -> Vec<Details> {
                 }
             }
             if rel.lanes.staging {
-                let ready = board.column_cards(Column::Staging, Some(&rel.project));
+                let ready = board.changes_in(Column::Staging, Some(&rel.project));
                 rows.push((
                     "Next release",
                     if ready.is_empty() {

@@ -342,6 +342,65 @@ fn cards_without_a_firstmate_card_are_grey() {
 }
 
 #[test]
+fn work_that_is_not_a_release_is_a_dim_labelled_group_in_live() {
+    let mut a = release_app();
+    let shop = tab_index(&a, "Shop");
+    a.select_tab(shop);
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains(" Live 4 + 1 done"), "{screen}");
+    let rows: Vec<&str> = screen.lines().collect();
+    let label = rows
+        .iter()
+        .position(|r| r.contains("─ Done · not a release"))
+        .unwrap_or_else(|| panic!("no Done label\n{screen}"));
+    let report = rows
+        .iter()
+        .position(|r| r.contains("Second opinion on two bugs"))
+        .unwrap();
+    assert_eq!(
+        report,
+        label + 2,
+        "the label sits right above the group\n{screen}"
+    );
+
+    let b = crate::model::tests::release_board();
+    let done = b
+        .cards
+        .iter()
+        .find(|c| c.id == "shop-worth-fixing")
+        .unwrap();
+    let lines = card_lines(done, 30, false, now(), None);
+    assert_eq!(
+        lines[1].spans.last().unwrap().style.fg,
+        Some(Color::DarkGray)
+    );
+
+    // A Live column holding only such work labels it in the header rule.
+    let mut b = crate::model::tests::release_board();
+    b.cards
+        .retain(|c| c.column != Column::Live || c.not_release);
+    let mut a = App::with_board(b, "/fm".into(), now());
+    let shop = tab_index(&a, "Shop");
+    a.select_tab(shop);
+    let screen = draw(&mut a, 252, 40);
+    assert!(screen.contains(" Live 0 + 1 done"), "{screen}");
+    assert!(screen.contains("─ Done · not a release"), "{screen}");
+}
+
+#[test]
+fn promotion_cards_carry_a_promotion_badge() {
+    let mut b = crate::model::tests::release_board();
+    let c = b
+        .cards
+        .iter_mut()
+        .find(|c| c.id == "shop-deploy-hook")
+        .unwrap();
+    c.promotion = true;
+    let lines = card_lines(c, 30, false, now(), None);
+    assert_eq!(lines[1].spans[1].content, "⇡ ");
+}
+
+#[test]
 fn base64_matches_the_standard_alphabet() {
     assert_eq!(base64(b""), "");
     assert_eq!(base64(b"f"), "Zg==");

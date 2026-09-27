@@ -3,7 +3,7 @@
 use std::fmt::Write;
 
 use crate::config::Config;
-use crate::model::{Board, Card, Column};
+use crate::model::{Board, Card, Column, column_count};
 use crate::notes::{column_header, details};
 
 fn card_line(card: &Card, now: i64) -> String {
@@ -19,6 +19,9 @@ fn card_line(card: &Card, now: i64) -> String {
     }
     if card.outside {
         s.push_str("[no card] ");
+    }
+    if card.promotion {
+        s.push_str("[promotion] ");
     }
     if !card.blocked_by.is_empty() {
         let _ = write!(s, "[after {}] ", card.blocked_by.join(","));
@@ -82,14 +85,24 @@ pub fn render_text(board: &Board, config: &Config, tab: Option<&str>, now: i64) 
     }
     for column in Column::ALL {
         let cards = board.column_cards(column, tab);
-        let _ = write!(out, "\n{} ({})", config.label(column), cards.len());
+        let _ = write!(
+            out,
+            "\n{} ({})",
+            config.label(column),
+            column_count(cards.iter().copied())
+        );
         match column_header(board, column, tab).first() {
             Some(h) => {
                 let _ = writeln!(out, " — {h}");
             }
             None => out.push('\n'),
         }
+        let mut done = false;
         for c in cards {
+            if c.not_release && !done {
+                done = true;
+                let _ = writeln!(out, "  ── Done · not a release");
+            }
             let _ = writeln!(out, "{}", card_line(c, now));
         }
     }
@@ -148,9 +161,15 @@ mod tests {
         let b = crate::model::tests::release_board();
         let text = render_text(&b, &Config::default(), Some("Shop"), now());
         assert!(
-            text.contains("Live (5) — 25 Sep · #150 · v1.2.1 · 4 changes"),
+            text.contains("Live (4 + 1 done) — 25 Sep · #150 · v1.2.1 · 4 changes"),
             "{text}"
         );
+        let done = text
+            .find("── Done · not a release")
+            .expect("the Done group");
+        let report = text.find("Second opinion on two bugs").unwrap();
+        let release = text.find("[no card] Shop #141").unwrap();
+        assert!(release < done && done < report, "{text}");
         assert!(
             text.contains("Staging (1) — 1 to promote · 1 db change"),
             "{text}"

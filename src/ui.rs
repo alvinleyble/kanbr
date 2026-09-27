@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::dates::now_epoch;
 use crate::firstmate::fingerprint;
 use crate::loader::Loader;
-use crate::model::{Ask, Board, Card, Column, Owner, TestBadge, Tone, assumed_lanes};
+use crate::model::{Ask, Board, Card, Column, Owner, TestBadge, Tone, assumed_lanes, column_count};
 use crate::notes::{column_header, details, release_notes};
 use crate::requests::{FLASH_SECS, Kind, Mark, Pending, Tracker};
 use crate::secret::{self, Secret};
@@ -930,7 +930,8 @@ pub fn card_lines(
     now: i64,
     mark: Option<&Mark>,
 ) -> Vec<Line<'static>> {
-    let greyed = card.paused;
+    // Work that is not a release reads dim, like paused work.
+    let greyed = card.paused || card.not_release;
     let plain = card.outside;
     let fg = |c: Color| {
         if greyed {
@@ -1014,6 +1015,9 @@ pub fn card_lines(
     }
     if !card.blocked_by.is_empty() {
         badge(&mut l2, "⧗ ", Style::new().fg(fg(Color::Yellow)));
+    }
+    if card.promotion {
+        badge(&mut l2, "⇡ ", Style::new().fg(fg(Color::Cyan)));
     }
     let title_style = if greyed {
         DIM
@@ -1288,7 +1292,7 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
         };
         let header = Line::from(vec![
             Span::styled(format!(" {title}"), header_style),
-            Span::styled(format!(" {}", cards.len()), DIM),
+            Span::styled(format!(" {}", column_count(&cards)), DIM),
         ]);
         f.render_widget(
             Paragraph::new(header),
@@ -1363,6 +1367,14 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
             );
             f.render_widget(Paragraph::new(lines), r);
             app.hits.cards.push((r, ci, idx));
+            // The Done group's label sits in the row above its first card:
+            // the gap after the card before, or the header rule.
+            if cards[idx].not_release && (idx == 0 || !cards[idx - 1].not_release) {
+                f.render_widget(
+                    Paragraph::new(Line::styled(done_rule(list.width as usize), DIM)),
+                    Rect::new(list.x, y - 1, list.width, 1),
+                );
+            }
         }
         let below = cards.len().saturating_sub(scroll + visible);
         if below > 0 || scroll > 0 {
@@ -1380,6 +1392,13 @@ fn render_columns(app: &mut App, f: &mut Frame, area: Rect) {
             );
         }
     }
+}
+
+/// The rule that labels the Done group, fitted to `width` cells.
+fn done_rule(width: usize) -> String {
+    let label = "─ Done · not a release ";
+    let rest = width.saturating_sub(text_width(label));
+    truncate(&format!("{label}{}", "─".repeat(rest)), width)
 }
 
 fn render_footer(app: &App, f: &mut Frame, area: Rect) {

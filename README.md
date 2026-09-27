@@ -41,7 +41,7 @@ lines up:
 | **Booked** | Held backlog items: a decision or grill waiting on you, or any other hold. A `grill` tag marks items that need a grill. Items of a halted project are greyed and paused. |
 | **Ready** | Queued work that is not held. An item waiting on another task stays here with a `⧗` dependency badge. |
 | **Building** | Work in flight: every live Firstmate worker. |
-| **Dev**, **Staging**, **Live** | Merged changes, placed by git in the furthest branch each has reached (see [Releases](#releases)). **Live** shows only the latest production release. |
+| **Dev**, **Staging**, **Live** | Merged changes and promotions, placed by git in the furthest branch each has reached (see [Releases](#releases)). **Live** shows only the latest production release, with finished work that is not a release in a dim `Done · not a release` group below it. |
 
 ### Releases
 
@@ -72,11 +72,19 @@ anywhere, including directly on GitHub, moves its cards on the next refresh.
   says `release boundary unknown` and no change is claimed for the release.
 - **Changes made outside Firstmate.** A merged PR or direct commit with no Firstmate
   card (a hand-opened PR, a manual commit) still shows, as a plain grey card titled
-  from the PR or commit, so release headers and notes stay complete. Promotion PRs
-  are not cards: they are what moves the cards, and the Live header links the one
-  that made the release.
-- **Finished work with no PR** (a report, a local task) is shown in the project's
-  last lane until that project's next release, for at most `finished_days`.
+  from the PR or commit, so release headers and notes stay complete.
+- **Promotion tasks.** A Firstmate card whose recorded PR is a promotion (dev to
+  staging, or staging to main) sits in the furthest lane that promotion has reached,
+  with a `⇡` badge and the state `promoted`: Staging for a dev-to-staging promotion
+  until the next release carries it to Live. A promotion is never counted as one of
+  a release's changes. Kanbr places a promotion task only when its backlog record
+  names the promotion PR; a record with no PR link is finished work with no PR.
+- **Finished work with no PR is not a release.** A report, a setup, or a local task
+  sits in a dim group at the bottom of the project's last lane, under a
+  `Done · not a release` rule, so only real releases and merged changes read as
+  shipped. It stays until that project's next release, for at most `finished_days`.
+  Column counts give it apart: `Live 1 + 3 done` is one shipped card and three
+  finished pieces of work that are not a release.
 - **As of the last fetch.** Kanbr never fetches. It reads each clone's
   remote-tracking branches (`origin/dev` and so on, falling back to local branches),
   so the board shows what the forge had when the clone last fetched. A merged card
@@ -111,7 +119,8 @@ strip, to jump from one to the next.
 
 1. the project and PR number (plus a `2nd` tag for a second mate's work);
 2. the title, after its badges: `⚑` decision, a test badge (reserved for Firstmate's
-   test results, which are not published yet), `grill`, and `⧗` dependency;
+   test results, which are not published yet), `grill`, `⧗` dependency, and `⇡`
+   promotion;
 3. the worker's model, elapsed time, and state.
 
 Press `Enter` (or double-click a card) for the details: hold reason, blockers,
@@ -190,8 +199,9 @@ that step. Kanbr first shows what it will ask, then sends it when you press `Ent
 A card moves one lane at a time, to the next lane its project uses: a project with
 no staging branch goes from Dev to Live (a main promotion), and one with only
 `main` merges from Building straight to Live (with the main passphrase). A
-promotion moves everything in the lane, and the confirmation lists it, with any
-database migrations going live. Backward drags are refused, since they would mean
+promotion moves everything in the lane, and the confirmation lists the changes it
+carries (not promotion tasks or finished work with no PR), with any database
+migrations going live. Backward drags are refused, since they would mean
 reverts; so are drags of a halted project's cards.
 
 ### Requested, moved, or snapped back

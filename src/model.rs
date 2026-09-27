@@ -12,10 +12,13 @@
 //!   branch configured to back it (default `dev`, `staging`, `main`); a project
 //!   missing a branch never shows cards in that column, so the All tab lines
 //!   up. Each merged card keeps its PR and sits in the furthest lane its change
-//!   has reached; Live holds only the latest production release. Merged
+//!   has reached; Live holds only the latest production release. A card whose
+//!   PR is a promotion (dev to staging, staging to main) sits, styled as a
+//!   promotion, in the furthest lane that promotion has reached. Merged
 //!   changes with no Firstmate card (hand-opened PRs, direct commits) are plain
 //!   grey cards titled from the PR or commit. Finished work with no PR
-//!   (reports, local tasks) is shown in the project's last lane until its next
+//!   (reports, setups, local tasks) is not a release: it is shown in a dim
+//!   Done group at the bottom of the project's last lane until its next
 //!   release. Where the repository cannot be read, or a merged PR is not in
 //!   it yet, merged work falls back to the first lane for `finished_days`.
 //! - A captain decision is a red badge on the card, which stays in its real
@@ -184,6 +187,12 @@ pub struct Card {
     pub outside: bool,
     /// Part of its project's latest Live release.
     pub in_release: bool,
+    /// Its PR promoted one lane into the next (dev to staging, staging to
+    /// main) rather than merging a change.
+    pub promotion: bool,
+    /// Finished work with no PR (a report, a setup, a local task): shown in
+    /// its lane's dim Done group, apart from releases and merged changes.
+    pub not_release: bool,
     /// The PR title or commit subject from git, for release notes.
     pub change_title: Option<String>,
     hold_reason: Option<String>,
@@ -203,6 +212,20 @@ impl Card {
         } else {
             format_elapsed(now - since)
         })
+    }
+}
+
+/// A column's card count, with finished work that is not a release counted
+/// apart: `1 + 3 done`.
+pub fn column_count<'a>(cards: impl IntoIterator<Item = &'a Card>) -> String {
+    let (mut all, mut done) = (0, 0);
+    for c in cards {
+        all += 1;
+        done += usize::from(c.not_release);
+    }
+    match done {
+        0 => all.to_string(),
+        _ => format!("{} + {done} done", all - done),
     }
 }
 
@@ -274,6 +297,15 @@ impl Board {
             .collect()
     }
 
+    /// The changes in a column: its cards less promotions and finished work
+    /// that is not a release.
+    pub fn changes_in(&self, column: Column, project: Option<&str>) -> Vec<&Card> {
+        self.column_cards(column, project)
+            .into_iter()
+            .filter(|c| !c.promotion && !c.not_release)
+            .collect()
+    }
+
     /// Cards waiting on the captain, in board order (column, then position).
     pub fn waiting(&self) -> Vec<&Card> {
         self.cards.iter().filter(|c| c.decision).collect()
@@ -293,7 +325,7 @@ impl Board {
 
     /// The cards of a project's latest Live release (or of every project's).
     pub fn release_cards(&self, project: Option<&str>) -> Vec<&Card> {
-        self.column_cards(Column::Live, project)
+        self.changes_in(Column::Live, project)
             .into_iter()
             .filter(|c| c.in_release)
             .collect()
@@ -419,6 +451,8 @@ fn outside_card(project: &str, g: &ProjectGit, c: &Change) -> Card {
         details,
         outside: true,
         in_release: c.in_release,
+        promotion: false,
+        not_release: false,
         change_title: Some(c.title.clone()),
         hold_reason: None,
         hold_kind: None,
@@ -452,8 +486,9 @@ struct Builder<'a> {
 /// Where a merged card's PR sits in its project's history.
 enum Found {
     Change(usize),
-    /// A promotion or back-merge PR: shown through the release headers.
-    Promotion,
+    Promotion(usize),
+    /// A higher lane merged back down: not on the board.
+    BackMerge,
     Missing,
 }
 
@@ -598,7 +633,8 @@ impl<'a> Builder<'a> {
     fn find_change(&self, g: &ProjectGit, pr_url: &str) -> Found {
         let role = |r: &Role| match r {
             Role::Change(i) => Found::Change(*i),
-            Role::Promotion | Role::BackMerge => Found::Promotion,
+            Role::Promotion(i) => Found::Promotion(*i),
+            Role::BackMerge => Found::BackMerge,
         };
         // A PR in another repository (an upstream contribution) is not one of
         // this repository's numbered PRs.
@@ -743,6 +779,8 @@ impl<'a> Builder<'a> {
             details,
             outside: false,
             in_release: false,
+            promotion: false,
+            not_release: false,
             change_title: None,
             hold_reason,
             hold_kind,
@@ -868,6 +906,8 @@ impl<'a> Builder<'a> {
             details,
             outside: false,
             in_release: false,
+            promotion: false,
+            not_release: false,
             change_title: None,
             hold_reason: string_at(r, "hold_reason"),
             hold_kind: string_at(r, "hold_kind"),
@@ -876,9 +916,9 @@ impl<'a> Builder<'a> {
     }
 
     /// A Dev/Staging/Live card for finished work, or `None` when it is not on
-    /// the board: a change released before the project's latest release, a
-    /// promotion PR (shown through the release headers), or unplaced work
-    /// that finished longer ago than the configured window.
+    /// the board: a change or promotion released before the project's latest
+    /// release, a back-merge PR, or unplaced work that finished longer ago
+    /// than the configured window.
     fn finished_card(
         &mut self,
         rec: &Value,
@@ -905,6 +945,7 @@ impl<'a> Builder<'a> {
             .map_or_else(|| self.assumed_lanes(), |g| g.lanes);
 
         let mut change: Option<Change> = None;
+        let mut promotion = false;
         let mut unfetched = false;
         if let (Some(g), Some(url)) = (git.as_deref(), pr_url.as_deref())
             && g.top().is_some()
@@ -918,7 +959,15 @@ impl<'a> Builder<'a> {
                     self.claimed.entry(project.clone()).or_default().insert(i);
                     change = Some(c.clone());
                 }
-                Found::Promotion => return None,
+                Found::Promotion(i) => {
+                    let c = &g.promotions[i];
+                    if !g.visible(c, recent) {
+                        return None;
+                    }
+                    promotion = true;
+                    change = Some(c.clone());
+                }
+                Found::BackMerge => return None,
                 Found::Missing => unfetched = true,
             }
         }
@@ -937,7 +986,8 @@ impl<'a> Builder<'a> {
                     self.laneless.push(project);
                     return None;
                 };
-                // Unmerged finished work in Live stays until the next release.
+                // Unmerged finished work (not a release) in Live stays until
+                // the next release.
                 if !merged
                     && column == Column::Live
                     && let (Some(f), Some(r)) =
@@ -949,6 +999,7 @@ impl<'a> Builder<'a> {
                 column
             }
         };
+        let not_release = change.is_none() && !merged;
         let mut details = vec![("ID", id.clone())];
         for (label, key) in [
             ("Kind", "kind"),
@@ -961,7 +1012,16 @@ impl<'a> Builder<'a> {
                 details.push((label, v.to_owned()));
             }
         }
+        if not_release {
+            details.push((
+                "Release",
+                "not a release: finished work with no PR".to_owned(),
+            ));
+        }
         if let (Some(c), Some(g)) = (&change, &git) {
+            if promotion {
+                details.push(("Promotion", format!("reached {}", c.column.title())));
+            }
             details.push(("Landed", landed(g, c)));
             if c.in_release {
                 details.push(("Release", "in the latest Live release".to_owned()));
@@ -975,6 +1035,11 @@ impl<'a> Builder<'a> {
                     .to_owned(),
             ));
         }
+        let state = if promotion {
+            "promoted"
+        } else {
+            verb.unwrap_or("done")
+        };
         Some(Card {
             pr_number: pr_url.as_deref().and_then(pr_number),
             pr_url,
@@ -992,11 +1057,17 @@ impl<'a> Builder<'a> {
             model: None,
             since: change.as_ref().map_or(finished, |c| Some(c.time)),
             since_is_date: true,
-            state: verb.unwrap_or("done").to_owned(),
-            tone: Tone::Finished,
+            state: state.to_owned(),
+            tone: if not_release {
+                Tone::Muted
+            } else {
+                Tone::Finished
+            },
             details,
             outside: false,
             in_release: change.as_ref().is_some_and(|c| c.in_release),
+            promotion,
+            not_release,
             change_title: change.map(|c| c.title),
             hold_reason: None,
             hold_kind: None,
@@ -1294,9 +1365,11 @@ impl<'a> Builder<'a> {
                     .then(a.paused.cmp(&b.paused))
                     .then(a.order.cmp(&b.order)),
                 Column::Building => a.order.cmp(&b.order),
-                Column::Dev | Column::Staging | Column::Live => b
-                    .in_release
-                    .cmp(&a.in_release)
+                // Work that is not a release sits in its own group last.
+                Column::Dev | Column::Staging | Column::Live => a
+                    .not_release
+                    .cmp(&b.not_release)
+                    .then(b.in_release.cmp(&a.in_release))
                     .then(b.since.cmp(&a.since))
                     .then(a.order.cmp(&b.order)),
             })

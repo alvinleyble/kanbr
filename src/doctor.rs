@@ -21,7 +21,7 @@ use crate::firstmate::{
 use crate::forge::{self, GhError};
 use crate::json::{arr_at, get, str_at};
 use crate::loader::Loader;
-use crate::model::{Column, Context, Env, build_board};
+use crate::model::{Column, Context, Env, build_board, column_count};
 use crate::releases::ProjectGit;
 
 /// A clone not fetched for this long makes the board lag the forge.
@@ -754,7 +754,7 @@ pub fn run(home_flag: Option<&Path>, config_path: Option<&Path>) -> Vec<Check> {
             format!(
                 "{} {}",
                 config.label(*c),
-                board.column_cards(*c, None).len()
+                column_count(board.column_cards(*c, None))
             )
         })
         .collect();

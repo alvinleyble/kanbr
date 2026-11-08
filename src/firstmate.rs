@@ -35,11 +35,13 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::json::str_at;
+use crate::platform::{script_command, script_path};
 
 pub const SNAPSHOT_SCRIPT: &str = "bin/fm-fleet-snapshot.sh";
 pub const SNAPSHOT_SCHEMA: &str = "fm-fleet-snapshot.v1";
 pub const PROJECTS_REGISTRY: &str = "data/projects.md";
-pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(45);
+/// The snapshot forks many processes, which Windows does several times slower.
+pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(if cfg!(windows) { 150 } else { 45 });
 
 pub const INBOX_SCRIPT: &str = "bin/fm-inbox.sh";
 pub const HOLD_SCRIPT: &str = "bin/fm-captain-hold.sh";
@@ -101,10 +103,10 @@ pub fn run_snapshot(home: &Path, timeout: Duration) -> Result<Value, String> {
     if !script.is_file() {
         return Err(format!("{} is missing", script.display()));
     }
-    let mut cmd = Command::new(&script);
+    let mut cmd = script_command(&script)?;
     cmd.arg("--json")
         .current_dir(home)
-        .env("FM_HOME", home)
+        .env("FM_HOME", script_path(home))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -12,6 +12,7 @@ mod json;
 mod loader;
 mod model;
 mod notes;
+mod platform;
 mod print;
 mod releases;
 mod requests;
@@ -76,8 +77,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         match flag.as_str() {
             "-h" | "--help" => out.help = true,
             "-V" | "--version" => out.version = true,
-            "--home" => out.home = Some(PathBuf::from(value("--home")?)),
-            "--config" => out.config = Some(PathBuf::from(value("--config")?)),
+            "--home" => out.home = Some(platform::native_path(&value("--home")?)),
+            "--config" => out.config = Some(platform::native_path(&value("--config")?)),
             "--tab" => out.tab = Some(value("--tab")?),
             "help" if out.command.is_none() => out.help = true,
             cmd if !cmd.starts_with('-') && out.command.is_none() => match cmd {
@@ -214,9 +215,13 @@ mod tests {
         assert!(parse(&["help"]).unwrap().help);
         assert!(parse(&["--version"]).unwrap().version);
         assert_eq!(
-            parse(&["doctor", "--config=/c"]).unwrap().config,
-            Some(PathBuf::from("/c"))
+            parse(&["doctor", "--config=/cfg"]).unwrap().config,
+            Some(PathBuf::from("/cfg"))
         );
+        // Git Bash spells a drive `/d/fm`; Windows programs need `D:/fm`.
+        let drive = parse(&["print", "--home", "/d/fm"]).unwrap().home;
+        let want = if cfg!(windows) { "D:/fm" } else { "/d/fm" };
+        assert_eq!(drive, Some(PathBuf::from(want)));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::forge::{self, GhError};
 use crate::json::{arr_at, get, str_at};
 use crate::loader::Loader;
 use crate::model::{Column, Context, Env, build_board, column_count};
+use crate::platform::{script_command, script_path};
 use crate::releases::ProjectGit;
 
 /// A clone not fetched for this long makes the board lag the forge.
@@ -299,10 +300,10 @@ fn probe(home: &Path, rel: &str, args: &[&str]) -> Result<String, String> {
     if !is_executable(&path) {
         return Err(format!("{} is missing or not executable", path.display()));
     }
-    let mut cmd = Command::new(&path);
+    let mut cmd = script_command(&path)?;
     cmd.args(args)
         .current_dir(home)
-        .env("FM_HOME", home)
+        .env("FM_HOME", script_path(home))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::firstmate::run_bounded;
 use crate::json::{arr_at, str_at};
+use crate::platform::script_path;
 
 pub const WORKSPACE_LABEL: &str = "Kanbr";
 pub const PANE_LABEL: &str = "Kanbr";
@@ -57,7 +58,11 @@ pub fn board_running(process_info: &Value) -> bool {
                 .or_else(|| arr_at(p, "argv").first().and_then(Value::as_str))
                 .or_else(|| str_at(p, "name"))
                 .unwrap_or("");
-            Path::new(argv0).file_name().and_then(|n| n.to_str()) == Some("kanbr")
+            // `kanbr.exe` on Windows.
+            Path::new(argv0)
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("kanbr"))
         })
 }
 
@@ -73,6 +78,9 @@ pub fn board_command(
         let s = p
             .to_str()
             .ok_or_else(|| format!("path is not UTF-8: {}", p.display()))?;
+        // The pane's shell is bash (Git Bash on Windows), where a backslash
+        // would escape the next character.
+        let s = &script_path(Path::new(s));
         if s.contains('\'') || s.contains('\n') {
             return Err(format!("path contains a quote or newline: {s}"));
         }
@@ -149,6 +157,7 @@ pub fn open(home: Option<&Path>, config: Option<&Path>) -> Result<String, String
     let cwd = match home {
         Some(h) => h.to_path_buf(),
         None => env::var_os("HOME")
+            .or_else(|| env::var_os("USERPROFILE").filter(|_| cfg!(windows)))
             .map(Into::into)
             .unwrap_or_else(|| "/".into()),
     };

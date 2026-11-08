@@ -296,6 +296,9 @@ plugin checkout:
    platform, or a failed download), it builds from source with `cargo build
    --release --locked`. That needs Rust from [rustup.rs](https://rustup.rs).
 
+On Windows the build step is `cargo build --release --locked`, since there is no
+prebuilt Windows binary yet; see [On Windows](#on-windows).
+
 The plugin adds one action, **Open Kanbr board** (`kanbr.open`). It opens the board
 in its own `Kanbr` workspace. If the board is already open there, the action
 focuses it; if you quit the board, the action starts it again in the same pane. To
@@ -318,11 +321,33 @@ the one the plugin installed:
 ln -sf "$(ls -d ~/.config/herdr/plugins/github/kanbr-*/target/release/kanbr | head -n 1)" ~/.local/bin/kanbr
 ```
 
-or install it with Cargo:
+or install it with Cargo (this also works on Windows):
 
 ```sh
 cargo install --git https://github.com/alvinleyble/kanbr --locked
 ```
+
+### On Windows
+
+Kanbr runs natively on Windows 11 next to a Firstmate home that runs under
+[Git for Windows](https://gitforwindows.org) (Git Bash). Herdr's plugin support on
+Windows is a preview, and it builds on Windows with Rust (there is no prebuilt
+Windows binary yet), so you need:
+
+- Rust, from [rustup.rs](https://rustup.rs), with `cargo` on `PATH`;
+- Git for Windows. Firstmate's scripts are bash scripts, which Windows cannot run
+  directly, so Kanbr runs each one through Git Bash. It finds `bash.exe` on `PATH`
+  (never the WSL launcher in `System32`), beside `git.exe`, or in the usual Git
+  folders; set `KANBR_BASH` to a `bash.exe` to choose one;
+- Herdr panes that start Git Bash (the board command is quoted for bash). In
+  Herdr's `config.toml`: `default_shell = 'C:\Program Files\Git\bin\bash.exe'`.
+
+The binary is `target\release\kanbr.exe`. Paths may be spelled the Windows way
+(`D:\firstmate`, `D:/firstmate`) or the Git Bash way (`/d/firstmate`) in `--home`,
+`KANBR_FM_HOME`, `FM_HOME`, and the config file; Kanbr hands Firstmate's scripts the
+`D:/firstmate` spelling that Firstmate prints itself. Reading the fleet snapshot is
+slower on Windows (about 40 seconds on a quiet machine), so the first board draw
+takes a moment and Kanbr waits up to 150 seconds for it.
 
 ### Point Kanbr at your Firstmate home
 
@@ -504,10 +529,12 @@ cargo fmt --check
 ```
 
 CI runs the format check, build, clippy, tests, and the install script on Linux
-and macOS for every pull request.
+and macOS for every pull request. Windows is not in CI yet; `cargo build --release
+--locked`, `cargo test --locked`, and `cargo clippy --all-targets --locked -- -D
+warnings` pass there.
 
 To publish prebuilt binaries, bump `version` in both `Cargo.toml` and
 `herdr-plugin.toml` (a test keeps them equal), merge, then push the tag
 `v<version>`. The release workflow builds macOS and Linux binaries for arm64 and
-x86_64, and attaches them with SHA-256 checksums to a GitHub release. Plugin
+x86_64 (not Windows yet), and attaches them with SHA-256 checksums to a GitHub release. Plugin
 installs download those binaries.

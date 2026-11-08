@@ -48,6 +48,7 @@ use crate::firstmate::{HOLD_SCRIPT, INBOX_SCRIPT, last_line, run_bounded_input};
 use crate::forge::{self, GhError};
 use crate::json::{arr_at, bool_at, get, str_at};
 use crate::model::{Ask, Board, Card, Column, Owner, assumed_lanes, landing_column};
+use crate::platform::{script_command, script_path};
 use crate::secret::Secret;
 
 pub const REQUEST_SCHEMA: &str = "kanbr-request.v1";
@@ -628,8 +629,8 @@ fn script(home: &Path, rel: &str) -> Result<Command, String> {
     if !path.is_file() {
         return Err(format!("{} is missing", path.display()));
     }
-    let mut cmd = Command::new(&path);
-    cmd.current_dir(home).env("FM_HOME", home);
+    let mut cmd = script_command(&path)?;
+    cmd.current_dir(home).env("FM_HOME", script_path(home));
     Ok(cmd)
 }
 

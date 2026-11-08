@@ -39,6 +39,7 @@ use crate::config::Config;
 use crate::dates::{DAY, format_age_days, format_elapsed, parse_date, parse_generation};
 use crate::firstmate::{Lanes, Meta};
 use crate::json::{arr_at, bool_at, get, i64_at, str_at, string_at, strings_at};
+use crate::platform::{is_separator, native_path, same_path};
 use crate::releases::{Change, ProjectGit, Role};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -496,9 +497,9 @@ impl<'a> Builder<'a> {
     fn new(snap: &'a Value, ctx: &'a Context<'a>) -> Self {
         let fm_root = str_at(snap, "roots.fm_root")
             .or_else(|| str_at(snap, "fm_home"))
-            .map(PathBuf::from);
+            .map(native_path);
         let projects_dir = str_at(snap, "roots.projects")
-            .map(PathBuf::from)
+            .map(native_path)
             .or_else(|| fm_root.as_ref().map(|r| r.join("projects")));
         Builder {
             snap,
@@ -512,15 +513,12 @@ impl<'a> Builder<'a> {
             claimed: HashMap::new(),
             mate_homes: arr_at(snap, "secondmate_current.records")
                 .iter()
-                .filter_map(|m| str_at(m, "home").map(PathBuf::from))
+                .filter_map(|m| str_at(m, "home").map(native_path))
                 .collect(),
             mate_home_by_id: arr_at(snap, "secondmate_current.records")
                 .iter()
                 .filter_map(|m| {
-                    Some((
-                        str_at(m, "id")?.to_owned(),
-                        PathBuf::from(str_at(m, "home")?),
-                    ))
+                    Some((str_at(m, "id")?.to_owned(), native_path(str_at(m, "home")?)))
                 })
                 .collect(),
             laneless: Vec::new(),
@@ -531,15 +529,15 @@ impl<'a> Builder<'a> {
 
     fn project(&self, repo: Option<&str>, id: &str) -> String {
         if let Some(repo) = repo {
-            let trimmed = repo.trim_end_matches('/');
+            let trimmed = repo.trim_end_matches(is_separator);
             if self
                 .fm_root
                 .as_deref()
-                .is_some_and(|r| Path::new(trimmed) == r)
+                .is_some_and(|r| same_path(Path::new(trimmed), r))
             {
                 return "firstmate".to_owned();
             }
-            let last = trimmed.rsplit('/').find(|s| !s.is_empty());
+            let last = trimmed.rsplit(is_separator).find(|s| !s.is_empty());
             if let Some(name) = last.map(|n| n.strip_suffix(".git").unwrap_or(n)) {
                 if name.eq_ignore_ascii_case("firstmate") {
                     return "firstmate".to_owned();
@@ -806,7 +804,7 @@ impl<'a> Builder<'a> {
             .to_owned();
         let project = self.project(str_at(r, "repo").or_else(|| str_at(t, "project")), id);
         let meta = meta_path
-            .or_else(|| str_at(t, "paths.meta.path").map(PathBuf::from))
+            .or_else(|| str_at(t, "paths.meta.path").map(native_path))
             .and_then(|p| self.ctx.env.meta(&p))
             .unwrap_or_default();
         let harness = str_at(t, "harness").or_else(|| meta.get("harness").map(String::as_str));
@@ -1230,7 +1228,7 @@ impl<'a> Builder<'a> {
                 continue;
             };
             let owner = Owner::Secondmate(mate.to_owned());
-            let home = str_at(m, "home").map(PathBuf::from);
+            let home = str_at(m, "home").map(native_path);
             if str_at(m, "provenance.selected") != Some("structured-home") {
                 self.notices.push(format!(
                     "second mate {mate}: home unreadable ({})",

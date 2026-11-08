@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::firstmate::SNAPSHOT_SCRIPT;
 use crate::model::Column;
+use crate::platform::native_path;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -223,8 +224,16 @@ fn word_list(value: &str) -> Vec<String> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .filter(|h| !h.is_empty())
+    // Windows programs started outside Git Bash have USERPROFILE but no HOME.
+    let var = |name: &str| env::var_os(name).filter(|h| !h.is_empty());
+    var("HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                var("USERPROFILE")
+            } else {
+                None
+            }
+        })
         .map(PathBuf::from)
 }
 
@@ -233,7 +242,7 @@ fn expand_tilde(value: &str) -> PathBuf {
         Some(rest) => home_dir()
             .map(|h| h.join(rest))
             .unwrap_or_else(|| PathBuf::from(value)),
-        None => PathBuf::from(value),
+        None => native_path(value),
     }
 }
 
@@ -287,7 +296,7 @@ pub fn resolve_home(flag: Option<&Path>, cfg: &Config) -> Result<(PathBuf, HomeS
     let env_path = |name: &str| {
         env::var_os(name)
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
+            .map(|v| native_path(&v.to_string_lossy()))
     };
     let explicit: [(Option<PathBuf>, HomeSource); 4] = [
         (flag.map(Path::to_path_buf), HomeSource::Flag),

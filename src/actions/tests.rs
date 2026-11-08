@@ -581,9 +581,9 @@ fn a_workers_question_is_answered_through_a_note() {
     assert!(body.contains("answer: use --dry-run"));
 }
 
-#[cfg(unix)]
+/// A Firstmate home whose scripts are fakes. They run the way the real ones
+/// do: directly on Unix, through Git Bash on Windows.
 fn fake_home(name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let root = std::env::temp_dir().join(format!("kanbr-act-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("bin")).unwrap();
@@ -608,12 +608,15 @@ echo "closed: $(cut -f1 "$FM_HOME/answer.log")"
     for (file, text) in [("fm-inbox.sh", inbox), ("fm-captain-hold.sh", hold)] {
         let p = root.join("bin").join(file);
         fs::write(&p, text).unwrap();
-        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
     root
 }
 
-#[cfg(unix)]
 #[test]
 fn the_real_transport_uses_firstmates_scripts_with_the_body_on_stdin() {
     let home = fake_home("main");

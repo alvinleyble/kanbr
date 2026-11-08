@@ -2,18 +2,26 @@
 #
 #   herdr plugin install alvinleyble/kanbr
 #
-# The build step puts the `kanbr` binary at target/release/kanbr: it downloads
-# the prebuilt binary for this version and platform from the GitHub release
-# (checksum-verified), or builds from source with cargo when none matches.
+# The build step puts the `kanbr` binary at target/release/kanbr: on Linux and
+# macOS it downloads the prebuilt binary for this version and platform from the
+# GitHub release (checksum-verified), or builds from source with cargo when none
+# matches. On Windows there is no prebuilt binary yet: it builds with cargo
+# (Rust from https://rustup.rs), which writes target/release/kanbr.exe, the
+# file the action's `./target/release/kanbr` names there.
 id = "kanbr"
 name = "Kanbr"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
 description = "Kanban board for Firstmate work: Booked, Ready, Building, then Dev, Staging, Live from git, with release headers and notes, project tabs, and a waiting-on-you strip. Answer decisions in place and drag cards forward as requests Firstmate carries out."
-platforms = ["linux", "macos"]
+platforms = ["linux", "macos", "windows"]
 
 [[build]]
+platforms = ["linux", "macos"]
 command = ["sh", "scripts/install.sh"]
+
+[[build]]
+platforms = ["windows"]
+command = ["cargo", "build", "--release", "--locked"]
 
 [[actions]]
 id = "open"
